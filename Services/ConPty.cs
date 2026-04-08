@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
+using static ShellPilot.Services.Win32Native;
 
 namespace ShellPilot.Services;
 
@@ -78,26 +79,14 @@ public static class ConPty
         IntPtr lpEnvironment, string? lpCurrentDirectory,
         IntPtr lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr hObject);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr GetCurrentProcess();
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
+    // Shared P/Invoke: see Win32Native.cs for GetCurrentProcess, CloseHandle,
+    // OpenProcessToken, CreateEnvironmentBlock, DestroyEnvironmentBlock
 
     // --- Constants ---
 
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
     private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
-    private const uint TOKEN_QUERY = 0x0008;
+    // TOKEN_QUERY is in Win32Native.cs
     private static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = (IntPtr)0x00020016;
 
     // Named Pipe constants
@@ -267,9 +256,11 @@ public static class ConPty
         // CRITICAL: STARTF_USESTDHANDLES with NULL handles forces the child process
         // to use the pseudoconsole for all I/O instead of inheriting parent's handles.
         // Without this, MSYS2/Git Bash writes to the parent's stdout, bypassing ConPTY.
-        const int startupInfoExSize = 112;
-        const int dwFlagsOffset = 60;
-        const int lpAttributeListOffset = 104;
+        // STARTUPINFOEXW layout on x64: sizeof(STARTUPINFOW)=104 + lpAttributeList pointer=8 = 112
+        // Cannot use Marshal.SizeOf because STARTUPINFOEXW is manually constructed in unmanaged memory.
+        const int startupInfoExSize = 112;  // sizeof(STARTUPINFOEXW) on x64
+        const int dwFlagsOffset = 60;       // offsetof(STARTUPINFOW, dwFlags)
+        const int lpAttributeListOffset = 104; // offsetof(STARTUPINFOEXW, lpAttributeList)
         const int STARTF_USESTDHANDLES = 0x00000100;
 
         var siPtr = Marshal.AllocHGlobal(startupInfoExSize);

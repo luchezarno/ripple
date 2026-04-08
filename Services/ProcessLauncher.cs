@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using static ShellPilot.Services.Win32Native;
 
 namespace ShellPilot.Services;
 
@@ -12,18 +13,7 @@ namespace ShellPilot.Services;
 /// </summary>
 public class ProcessLauncher
 {
-    // Win32 API declarations
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr GetCurrentProcess();
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
+    // Shared P/Invoke: see Win32Native.cs
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool CreateProcessW(
@@ -38,8 +28,7 @@ public class ProcessLauncher
         ref STARTUPINFOW lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr hObject);
+    // CloseHandle is in Win32Native.cs
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct STARTUPINFOW
@@ -64,7 +53,7 @@ public class ProcessLauncher
         public uint dwThreadId;
     }
 
-    private const uint TOKEN_QUERY = 0x0008;
+    // TOKEN_QUERY is in Win32Native.cs
     private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
     private const uint CREATE_NEW_CONSOLE = 0x00000010;
 

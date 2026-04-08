@@ -142,7 +142,7 @@ public class ConsoleWorker
         // On re-claim, start a new owned pipe for the new proxy.
         while (!ct.IsCancellationRequested)
         {
-            var ownedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            using var ownedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var ownedTask = RunPipeServerAsync(_pipeName, ownedCts.Token);
             var unownedTask = RunPipeServerAsync(_unownedPipeName, ct);
             var monitorTask = MonitorParentProxyAsync(ct);
@@ -168,7 +168,7 @@ public class ConsoleWorker
 
         // Cleanup
         readCts.Cancel();
-        _pty.Dispose();
+        _pty?.Dispose();
     }
 
     /// <summary>
@@ -351,18 +351,19 @@ public class ConsoleWorker
         await _writer.FlushAsync(ct);
     }
 
+    private readonly ManualResetEventSlim _readyEvent = new(false);
+
     private async Task WaitForReady(TimeSpan timeout, CancellationToken ct)
     {
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
+        // Wait for PromptStart signal from ReadOutputLoop (set via _readyEvent)
+        // instead of polling _ready every 100ms.
+        await Task.Run(() => _readyEvent.Wait(timeout, ct), ct).ConfigureAwait(false);
+
+        if (!_ready)
         {
-            ct.ThrowIfCancellationRequested();
-            if (_ready) return;
-            await Task.Delay(100, ct);
+            Log($"WARNING: No PromptStart received, proceeding without OSC markers");
+            _ready = true;
         }
-        // If no OSC marker arrived, proceed anyway (shell integration may not have loaded)
-        Log($"WARNING: No PromptStart received, proceeding without OSC markers");
-        _ready = true;
     }
 
     // --- User input forwarding ---
@@ -434,7 +435,7 @@ public class ConsoleWorker
                        firstLine.Contains(@"\WindowsApps\", StringComparison.OrdinalIgnoreCase);
             }
         }
-        catch { }
+        catch (Exception ex) { Log($"IsWslBash detection failed: {ex.Message}"); }
         return false;
     }
 
@@ -697,7 +698,10 @@ public class ConsoleWorker
                     {
                         _tracker.HandleEvent(evt);
                         if (!_ready && evt.Type == OscParser.OscEventType.PromptStart)
+                        {
                             _ready = true;
+                            _readyEvent.Set();
+                        }
                     }
 
                     if (result.Cleaned.Length > 0)
@@ -929,7 +933,7 @@ public class ConsoleWorker
             _pty?.InputStream.Write(bytes, 0, bytes.Length);
             _pty?.InputStream.Flush();
         }
-        catch { }
+        catch (Exception ex) { Log($"DisplayBanner kick failed: {ex.Message}"); }
 
         return SerializeResponse(new { status = "ok" });
     }
