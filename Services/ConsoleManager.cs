@@ -24,7 +24,6 @@ public class ConsoleManager
     private readonly Dictionary<string, AgentSessionState> _agentSessions = new();
     private readonly HashSet<int> _busyPids = new();
     private readonly HashSet<string> _allocatedSubAgentIds = new();
-    private string? _sessionShell;
 
     // Category naming
     private readonly int _categoryIndex;
@@ -140,15 +139,13 @@ public class ConsoleManager
 
     private async Task<StartConsoleResult> StartConsoleInnerAsync(string? shell, string? cwd, string? reason, string agentId)
     {
-        // Enforce single shell type
-        if (shell != null && _sessionShell != null && !shell.Equals(_sessionShell, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"Session shell is locked to '{_sessionShell}'. Cannot start '{shell}'.");
-
+        var resolvedShell = shell ?? GetDefaultShell();
+        var shellFamily = NormalizeShellFamily(resolvedShell);
         bool forceNew = !string.IsNullOrEmpty(reason);
 
         if (!forceNew)
         {
-            var standby = await FindStandbyConsoleAsync(agentId);
+            var standby = await FindStandbyConsoleAsync(agentId, shellFamily);
             if (standby != null)
             {
                 lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
@@ -156,25 +153,19 @@ public class ConsoleManager
             }
         }
 
-        _sessionShell ??= shell ?? GetDefaultShell();
-
         // Launch shellpilot.exe --console mode with ConPTY.
-        // Worker constructs pipe name SP.{proxyPid}.{agentId}.{ownPid} from its own PID.
-        // Proxy constructs the same name from the PID returned by CreateProcessW.
-        int pid = _launcher.LaunchConsoleWorker(ProxyPid, agentId, _sessionShell, cwd);
+        int pid = _launcher.LaunchConsoleWorker(ProxyPid, agentId, resolvedShell, cwd);
 
         var displayName = AssignConsoleName(pid);
         var pipeName = GetPipeName(agentId, pid);
         lock (_lock)
         {
-            _consoles[pid] = new ConsoleInfo(pipeName, displayName);
+            _consoles[pid] = new ConsoleInfo(pipeName, displayName, shellFamily);
             GetOrCreateAgentState(agentId).ActivePid = pid;
         }
 
-        // Wait for the worker's Named Pipe server to become ready
         await WaitForPipeReadyAsync(pipeName, TimeSpan.FromSeconds(30));
 
-        // Set the console window title (owned format: "#PID Name")
         try { await SendPipeRequestAsync(pipeName, new { type = "set_title", title = displayName }, TimeSpan.FromSeconds(3)); }
         catch { /* best-effort */ }
 
@@ -185,33 +176,63 @@ public class ConsoleManager
     /// Execute a command on the active console via Named Pipe.
     /// Serialized via _toolLock.
     /// </summary>
-    public async Task<ExecuteResult> ExecuteCommandAsync(string command, int timeoutSeconds, string agentId = "default")
+    public async Task<ExecuteResult> ExecuteCommandAsync(string command, int timeoutSeconds, string agentId = "default", string? shell = null)
     {
         await _toolLock.WaitAsync();
-        try { return await ExecuteCommandInnerAsync(command, timeoutSeconds, agentId); }
+        try { return await ExecuteCommandInnerAsync(command, timeoutSeconds, agentId, shell); }
         finally { _toolLock.Release(); }
     }
 
-    private async Task<ExecuteResult> ExecuteCommandInnerAsync(string command, int timeoutSeconds, string agentId)
+    private async Task<ExecuteResult> ExecuteCommandInnerAsync(string command, int timeoutSeconds, string agentId, string? shell)
     {
+        var requestedFamily = shell != null ? NormalizeShellFamily(shell) : null;
+
         int consolePid;
         string pipeName;
+
         lock (_lock)
         {
             consolePid = GetOrCreateAgentState(agentId).ActivePid;
-            pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath
-                       ?? GetPipeName(agentId, consolePid);
+
+            // Check if active console matches the requested shell
+            if (consolePid != 0 && requestedFamily != null)
+            {
+                var info = _consoles.GetValueOrDefault(consolePid);
+                if (info != null && !info.ShellFamily.Equals(requestedFamily, StringComparison.OrdinalIgnoreCase))
+                    consolePid = 0; // Force finding/starting a matching console
+            }
+
+            pipeName = consolePid != 0
+                ? _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid)
+                : "";
         }
 
+        // No active console, or active console is wrong shell type → switch
         if (consolePid == 0 || !IsProcessAlive(consolePid))
         {
-            // Auto-start console (call inner to avoid deadlock — we already hold _toolLock)
-            var startResult = await StartConsoleInnerAsync(null, null, null, agentId);
+            string switchedDisplayName;
+
+            // Try to find a standby of the right shell type
+            var standby = await FindStandbyConsoleAsync(agentId, requestedFamily);
+            if (standby != null)
+            {
+                lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
+                switchedDisplayName = standby.Value.DisplayName;
+            }
+            else
+            {
+                // No standby — auto-start a new console
+                var resolvedShell = shell ?? GetDefaultShell();
+                var startResult = await StartConsoleInnerAsync(resolvedShell, null, null, agentId);
+                switchedDisplayName = startResult.DisplayName;
+            }
+
+            // Don't execute — cwd may differ. Let the caller re-execute.
             return new ExecuteResult
             {
                 Switched = true,
-                DisplayName = startResult.DisplayName,
-                Output = $"Switched to console {startResult.DisplayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
+                DisplayName = switchedDisplayName,
+                Output = $"Switched to console {switchedDisplayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
             };
         }
 
@@ -248,9 +269,9 @@ public class ConsoleManager
         }
         catch (IOException)
         {
-            // Pipe broken — worker likely died. Clear and auto-start a new one.
             ClearDeadConsole(agentId, consolePid);
-            var startResult = await StartConsoleInnerAsync(null, null, null, agentId);
+            var resolvedShell = shell ?? GetDefaultShell();
+            var startResult = await StartConsoleInnerAsync(resolvedShell, null, null, agentId);
             return new ExecuteResult
             {
                 Switched = true,
@@ -362,18 +383,18 @@ public class ConsoleManager
     /// Find a standby console by enumerating pipes and querying get_status.
     /// Checks owned pipes for this agent first, then unowned pipes (orphaned by previous proxies).
     /// </summary>
-    private async Task<(int Pid, string DisplayName)?> FindStandbyConsoleAsync(string agentId)
+    private async Task<(int Pid, string DisplayName)?> FindStandbyConsoleAsync(string agentId, string? shellFamily = null)
     {
         // 1. Try owned pipes for this proxy + agent
-        var found = await TryFindInPipesAsync(EnumeratePipes(ProxyPid, agentId));
+        var found = await TryFindInPipesAsync(EnumeratePipes(ProxyPid, agentId), shellFamily);
         if (found.HasValue) return found;
 
         // 2. Try unowned pipes (workers whose original proxy died)
-        found = await TryFindInPipesAsync(EnumerateUnownedPipes());
+        found = await TryFindInPipesAsync(EnumerateUnownedPipes(), shellFamily);
         return found;
     }
 
-    private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes)
+    private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes, string? shellFamily = null)
     {
         foreach (var pipe in pipes)
         {
@@ -387,35 +408,47 @@ public class ConsoleManager
                     TimeSpan.FromSeconds(3));
 
                 var status = response.TryGetProperty("status", out var sp) ? sp.GetString() : null;
-                if (status is "standby" or "completed")
+                if (status is not ("standby" or "completed")) continue;
+
+                // Shell family filter: skip consoles that don't match the requested shell
+                var workerShell = response.TryGetProperty("shellFamily", out var sf) ? sf.GetString() : null;
+                if (shellFamily != null && workerShell != null &&
+                    !workerShell.Equals(shellFamily, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Already tracked by this proxy — just return it (no re-claim needed)
+                bool alreadyTracked;
+                lock (_lock) { alreadyTracked = _consoles.ContainsKey(pid.Value); }
+
+                if (alreadyTracked)
                 {
-                    var displayName = _consoles.GetValueOrDefault(pid.Value)?.DisplayName
-                        ?? AssignConsoleName(pid.Value);
-
-                    // Claim the console: worker starts a new owned pipe for this proxy
-                    var newPipeName = GetPipeName("default", pid.Value);
-                    try
-                    {
-                        await SendPipeRequestAsync(pipe, new
-                        {
-                            type = "claim",
-                            proxy_pid = ProxyPid,
-                            agent_id = "default",
-                            title = displayName
-                        }, TimeSpan.FromSeconds(3));
-
-                        // Wait briefly for worker to start the new owned pipe
-                        await WaitForPipeReadyAsync(newPipeName, TimeSpan.FromSeconds(5));
-                    }
-                    catch { /* fall back to unowned pipe */ newPipeName = pipe; }
-
-                    lock (_lock)
-                    {
-                        _consoles[pid.Value] = new ConsoleInfo(newPipeName, displayName);
-                    }
-
+                    var displayName = _consoles[pid.Value].DisplayName;
                     return (pid.Value, displayName);
                 }
+
+                // Unowned console — claim it
+                var displayNameNew = AssignConsoleName(pid.Value);
+                var newPipeName = GetPipeName("default", pid.Value);
+                try
+                {
+                    await SendPipeRequestAsync(pipe, new
+                    {
+                        type = "claim",
+                        proxy_pid = ProxyPid,
+                        agent_id = "default",
+                        title = displayNameNew
+                    }, TimeSpan.FromSeconds(3));
+
+                    await WaitForPipeReadyAsync(newPipeName, TimeSpan.FromSeconds(5));
+                }
+                catch { newPipeName = pipe; }
+
+                lock (_lock)
+                {
+                    _consoles[pid.Value] = new ConsoleInfo(newPipeName, displayNameNew, workerShell ?? "unknown");
+                }
+
+                return (pid.Value, displayNameNew);
             }
             catch
             {
@@ -706,7 +739,15 @@ public class ConsoleManager
 
     // --- Types ---
 
-    private record ConsoleInfo(string PipePath, string DisplayName);
+    private record ConsoleInfo(string PipePath, string DisplayName, string ShellFamily);
+
+    /// <summary>
+    /// Normalize a shell path/name to a canonical family name.
+    /// "bash", "/usr/bin/bash", "C:\Windows\System32\bash.exe" → "bash"
+    /// "pwsh", "pwsh.exe" → "pwsh"
+    /// </summary>
+    internal static string NormalizeShellFamily(string shell)
+        => Path.GetFileNameWithoutExtension(shell).ToLowerInvariant();
 
     public record StartConsoleResult(string Status, int Pid, string DisplayName);
 

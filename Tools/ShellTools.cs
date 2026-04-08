@@ -8,10 +8,10 @@ namespace ShellPilot.Tools;
 public class ShellTools
 {
     [McpServerTool]
-    [Description("Open a visible terminal window. The user can see and type in this terminal. AI commands sent via execute_command will also appear here. If a standby console exists, it will be reused unless reason is provided. Shell type is locked per session.")]
+    [Description("Open a visible terminal window. The user can see and type in this terminal. AI commands sent via execute_command will also appear here. If a standby console of the requested shell exists, it will be reused unless reason is provided. Multiple shell types can be active simultaneously.")]
     public static async Task<string> StartConsole(
         ConsoleManager consoleManager,
-        [Description("Shell to use. Name (bash, pwsh, zsh) or full path. Default: platform default. Locked after first use.")]
+        [Description("Shell to use. Name (bash, pwsh, zsh) or full path. Default: platform default.")]
         string? shell = null,
         [Description("Working directory. Default: home directory.")]
         string? cwd = null,
@@ -40,11 +40,13 @@ public class ShellTools
     }
 
     [McpServerTool]
-    [Description("Execute a command in the shared terminal. The command and its output are visible to the user in real time. Session state persists across calls. Call start_console first if no console is open.")]
+    [Description("Execute a command in the shared terminal. The command and its output are visible to the user in real time. Session state persists across calls. Call start_console first if no console is open. Optionally specify shell to target a specific shell type.")]
     public static async Task<string> ExecuteCommand(
         ConsoleManager consoleManager,
-        [Description("The command to execute")]
-        string command,
+        [Description("The pipeline to execute (supports pipes, e.g. 'ls | grep foo')")]
+        string pipeline,
+        [Description("Shell type to execute in (bash, pwsh, zsh, or full path). If omitted, uses the current active console. If specified and no matching console exists, one is auto-started.")]
+        string? shell = null,
         [Description("Timeout in seconds (0-170, default: 170). On timeout, execution continues and output is cached for wait_for_completion.")]
         int timeout_seconds = 170,
         [Description("Agent ID for sub-agent console isolation.")]
@@ -52,7 +54,7 @@ public class ShellTools
         CancellationToken cancellationToken = default)
     {
         var agentId = agent_id ?? "default";
-        var result = await consoleManager.ExecuteCommandAsync(command, timeout_seconds, agentId);
+        var result = await consoleManager.ExecuteCommandAsync(pipeline, timeout_seconds, agentId, shell);
 
         if (result.TimedOut)
             return $"⧗ {result.DisplayName} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";

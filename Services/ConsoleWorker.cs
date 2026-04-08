@@ -381,7 +381,7 @@ public class ConsoleWorker
         var hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
         if (hStdOut == IntPtr.Zero || hStdOut == (IntPtr)(-1)) return;
         if (!GetConsoleMode(hStdOut, out var mode)) return;
-        SetConsoleMode(hStdOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+        SetConsoleMode(hStdOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
 
     /// <summary>
@@ -774,7 +774,7 @@ public class ConsoleWorker
         return type switch
         {
             "execute" => await HandleExecuteAsync(request, ct),
-            "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput }),
+            "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput, shellFamily = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant() }),
             "get_cached_output" => HandleGetCachedOutput(),
             "set_title" => HandleSetTitle(request),
             "claim" => HandleClaim(request),
