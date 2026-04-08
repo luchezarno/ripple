@@ -51,13 +51,22 @@ public class OscParser
 
             if (oscIdx == -1)
             {
-                // No more OSC sequences — check for incomplete escape at end
+                // No more OSC sequences — check for incomplete OSC start at end.
+                // Only buffer if the trailing bytes could plausibly be the start of
+                // an OSC sequence (`\x1b` alone, or `\x1b]`). CSI sequences like
+                // `\x1b[K` must be passed through unbuffered, otherwise they get
+                // chopped across chunks and the visible console misrenders.
                 var escIdx = input.IndexOf('\x1b', i);
                 if (escIdx != -1 && escIdx >= input.Length - OscStart.Length)
                 {
-                    cleaned.Append(input, i, escIdx - i);
-                    _buffer = input[escIdx..];
-                    return new ParseResult(cleaned.ToString(), events);
+                    var remaining = input.Length - escIdx;
+                    bool couldBeOscStart = remaining == 1 || input[escIdx + 1] == ']';
+                    if (couldBeOscStart)
+                    {
+                        cleaned.Append(input, i, escIdx - i);
+                        _buffer = input[escIdx..];
+                        return new ParseResult(cleaned.ToString(), events);
+                    }
                 }
                 cleaned.Append(input, i, input.Length - i);
                 break;
