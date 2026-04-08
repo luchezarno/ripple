@@ -24,7 +24,8 @@ public class ConsoleWorker
 
     private string _pipeName;
     private readonly string _unownedPipeName;
-    private readonly int _proxyPid;
+    private int _proxyPid;
+    private TaskCompletionSource<string>? _claimTcs;
     private readonly string _shell;
     private readonly string _cwd;
     private IPtySession? _pty;
@@ -128,21 +129,34 @@ public class ConsoleWorker
         // Monitor visible console window resizes and propagate to ConPTY
         var resizeTask = ResizeMonitorLoop(ct);
 
-        // Run two pipe servers in parallel:
-        //   - owned pipe (SP.{proxyPid}.{agentId}.{ourPid}) for the current proxy
-        //   - unowned pipe (SP.{ourPid}) for future claim by another proxy
-        // Also monitor parent proxy lifetime and stop when it dies.
-        var serverCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var ownedTask = RunPipeServerAsync(_pipeName, serverCts.Token);
-        var unownedTask = RunPipeServerAsync(_unownedPipeName, serverCts.Token);
-        var monitorTask = MonitorParentProxyAsync(serverCts.Token);
+        // Run owned + unowned pipe servers. When proxy dies, stop owned pipe,
+        // keep unowned running for re-claim by another proxy.
+        // On re-claim, start a new owned pipe for the new proxy.
+        while (!ct.IsCancellationRequested)
+        {
+            var ownedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var ownedTask = RunPipeServerAsync(_pipeName, ownedCts.Token);
+            var unownedTask = RunPipeServerAsync(_unownedPipeName, ct);
+            var monitorTask = MonitorParentProxyAsync(ct);
 
-        await Task.WhenAny(ownedTask, unownedTask, monitorTask);
-        serverCts.Cancel();
-        await Task.WhenAll(
-            ownedTask.ContinueWith(_ => { }),
-            unownedTask.ContinueWith(_ => { }),
-            monitorTask.ContinueWith(_ => { }));
+            // Wait for proxy death or external cancellation
+            await monitorTask;
+
+            // Proxy died — stop owned pipe, keep unowned running
+            ownedCts.Cancel();
+            await ownedTask.ContinueWith(_ => { });
+
+            // Wait for re-claim via unowned pipe (blocks until _claimTcs is set)
+            _claimTcs = new TaskCompletionSource<string>();
+            Console.Title = $"#{Environment.ProcessId} ____";
+            Log("Proxy died, waiting for re-claim on unowned pipe...");
+
+            var newPipeName = await _claimTcs.Task;
+            _pipeName = newPipeName;
+            _proxyPid = GetProxyPidFromPipeName(newPipeName);
+            _claimTcs = null;
+            Log($"Re-claimed by proxy {_proxyPid}, new pipe={_pipeName}");
+        }
 
         // Cleanup
         readCts.Cancel();
@@ -164,9 +178,7 @@ public class ConsoleWorker
             }
             catch
             {
-                // Parent died — revert to unowned title and keep serving
-                // the unowned pipe so another proxy can claim this console.
-                Console.Title = $"#{Environment.ProcessId} ____";
+                // Parent died — main loop handles title revert and re-claim.
                 return;
             }
         }
@@ -765,6 +777,7 @@ public class ConsoleWorker
             "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput }),
             "get_cached_output" => HandleGetCachedOutput(),
             "set_title" => HandleSetTitle(request),
+            "claim" => HandleClaim(request),
             "ping" => SerializeResponse(new { status = "ok" }),
             _ => SerializeResponse(new { error = $"Unknown request type: {type}" }),
         };
@@ -832,6 +845,35 @@ public class ConsoleWorker
         if (title != null)
             Console.Title = title;
         return SerializeResponse(new { status = "ok" });
+    }
+
+    /// <summary>
+    /// Handle claim request from a new proxy. Constructs a new owned pipe name
+    /// and signals the main loop to start serving it.
+    /// </summary>
+    private JsonElement HandleClaim(JsonElement request)
+    {
+        var proxyPid = request.TryGetProperty("proxy_pid", out var pp) ? pp.GetInt32() : 0;
+        var agentId = request.TryGetProperty("agent_id", out var ai) ? ai.GetString() : "default";
+        var title = request.TryGetProperty("title", out var tp) ? tp.GetString() : null;
+
+        if (proxyPid == 0)
+            return SerializeResponse(new { status = "error", error = "proxy_pid required" });
+
+        var newPipeName = $"{ConsoleManager.PipePrefix}.{proxyPid}.{agentId}.{Environment.ProcessId}";
+        if (title != null) Console.Title = title;
+
+        // Signal the main loop to start the new owned pipe
+        _claimTcs?.TrySetResult(newPipeName);
+
+        return SerializeResponse(new { status = "ok", pipe = newPipeName });
+    }
+
+    private static int GetProxyPidFromPipeName(string pipeName)
+    {
+        // SP.{proxyPid}.{agentId}.{consolePid}
+        var parts = pipeName.Split('.');
+        return parts.Length >= 2 && int.TryParse(parts[1], out var pid) ? pid : 0;
     }
 
     // --- Pipe protocol (length-prefixed JSON) ---

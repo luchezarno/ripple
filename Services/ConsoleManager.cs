@@ -195,8 +195,13 @@ public class ConsoleManager
     private async Task<ExecuteResult> ExecuteCommandInnerAsync(string command, int timeoutSeconds, string agentId)
     {
         int consolePid;
-        lock (_lock) consolePid = GetOrCreateAgentState(agentId).ActivePid;
-        var pipeName = GetPipeName(agentId, consolePid);
+        string pipeName;
+        lock (_lock)
+        {
+            consolePid = GetOrCreateAgentState(agentId).ActivePid;
+            pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath
+                       ?? GetPipeName(agentId, consolePid);
+        }
 
         if (consolePid == 0 || !IsProcessAlive(consolePid))
         {
@@ -387,15 +392,27 @@ public class ConsoleManager
                     var displayName = _consoles.GetValueOrDefault(pid.Value)?.DisplayName
                         ?? AssignConsoleName(pid.Value);
 
+                    // Claim the console: worker starts a new owned pipe for this proxy
+                    var newPipeName = GetPipeName("default", pid.Value);
+                    try
+                    {
+                        await SendPipeRequestAsync(pipe, new
+                        {
+                            type = "claim",
+                            proxy_pid = ProxyPid,
+                            agent_id = "default",
+                            title = displayName
+                        }, TimeSpan.FromSeconds(3));
+
+                        // Wait briefly for worker to start the new owned pipe
+                        await WaitForPipeReadyAsync(newPipeName, TimeSpan.FromSeconds(5));
+                    }
+                    catch { /* fall back to unowned pipe */ newPipeName = pipe; }
+
                     lock (_lock)
                     {
-                        if (!_consoles.ContainsKey(pid.Value))
-                            _consoles[pid.Value] = new ConsoleInfo(pipe, displayName);
+                        _consoles[pid.Value] = new ConsoleInfo(newPipeName, displayName);
                     }
-
-                    // Update window title (console may have been unowned with "____" title)
-                    try { await SendPipeRequestAsync(pipe, new { type = "set_title", title = displayName }, TimeSpan.FromSeconds(3)); }
-                    catch { /* best-effort */ }
 
                     return (pid.Value, displayName);
                 }
