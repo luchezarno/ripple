@@ -139,21 +139,22 @@ public class ConsoleManager
 
     private async Task<StartConsoleResult> StartConsoleInnerAsync(string? shell, string? cwd, string? reason, string agentId, string? banner = null)
     {
-        var resolvedShell = shell ?? GetDefaultShell();
+        var rawShell = shell ?? GetDefaultShell();
 
         // Reject shell values that contain command-line options (e.g., "bash --login -i").
-        // The shell parameter should be a name (bash, pwsh) or a path to the executable.
-        var fileName = Path.GetFileName(resolvedShell);
+        var fileName = Path.GetFileName(rawShell);
         if (fileName.Contains(' '))
             throw new InvalidOperationException(
-                $"Shell parameter must be a shell name or path, not a command line. Got: '{resolvedShell}'");
+                $"Shell parameter must be a shell name or path, not a command line. Got: '{rawShell}'");
 
+        // Resolve to full path via PATH search (e.g., "pwsh" → "C:\Program Files\PowerShell\7\pwsh.exe")
+        var resolvedShell = ResolveShellPath(rawShell);
         var shellFamily = NormalizeShellFamily(resolvedShell);
         bool forceNew = !string.IsNullOrEmpty(reason);
 
         if (!forceNew)
         {
-            var standby = await FindStandbyConsoleAsync(agentId, shellFamily);
+            var standby = await FindStandbyConsoleAsync(agentId, resolvedShell);
             if (standby != null)
             {
                 lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
@@ -178,7 +179,7 @@ public class ConsoleManager
         var pipeName = GetPipeName(agentId, pid);
         lock (_lock)
         {
-            _consoles[pid] = new ConsoleInfo(pipeName, displayName, shellFamily);
+            _consoles[pid] = new ConsoleInfo(pipeName, displayName, shellFamily, resolvedShell);
             GetOrCreateAgentState(agentId).ActivePid = pid;
         }
 
@@ -203,7 +204,8 @@ public class ConsoleManager
 
     private async Task<ExecuteResult> ExecuteCommandInnerAsync(string command, int timeoutSeconds, string agentId, string? shell)
     {
-        var requestedFamily = shell != null ? NormalizeShellFamily(shell) : null;
+        // Resolve shell to full path for consistent matching
+        var resolvedShell = shell != null ? ResolveShellPath(shell) : null;
 
         int consolePid;
         string pipeName;
@@ -212,11 +214,11 @@ public class ConsoleManager
         {
             consolePid = GetOrCreateAgentState(agentId).ActivePid;
 
-            // Check if active console matches the requested shell
-            if (consolePid != 0 && requestedFamily != null)
+            // Check if active console matches the requested shell (by full path)
+            if (consolePid != 0 && resolvedShell != null)
             {
                 var info = _consoles.GetValueOrDefault(consolePid);
-                if (info != null && !info.ShellFamily.Equals(requestedFamily, StringComparison.OrdinalIgnoreCase))
+                if (info != null && !info.ShellPath.Equals(resolvedShell, PathComparison))
                     consolePid = 0; // Force finding/starting a matching console
             }
 
@@ -230,8 +232,8 @@ public class ConsoleManager
         {
             string switchedDisplayName;
 
-            // Try to find a standby of the right shell type
-            var standby = await FindStandbyConsoleAsync(agentId, requestedFamily);
+            // Try to find a standby matching the resolved shell path
+            var standby = await FindStandbyConsoleAsync(agentId, resolvedShell);
             if (standby != null)
             {
                 lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
@@ -240,8 +242,7 @@ public class ConsoleManager
             else
             {
                 // No standby — auto-start a new console
-                var resolvedShell = shell ?? GetDefaultShell();
-                var startResult = await StartConsoleInnerAsync(resolvedShell, null, null, agentId);
+                var startResult = await StartConsoleInnerAsync(shell ?? GetDefaultShell(), null, null, agentId);
                 switchedDisplayName = startResult.DisplayName;
             }
 
@@ -304,8 +305,7 @@ public class ConsoleManager
         catch (IOException)
         {
             ClearDeadConsole(agentId, consolePid);
-            var resolvedShell = shell ?? GetDefaultShell();
-            var startResult = await StartConsoleInnerAsync(resolvedShell, null, null, agentId);
+            var startResult = await StartConsoleInnerAsync(shell ?? GetDefaultShell(), null, null, agentId);
             return new ExecuteResult
             {
                 Switched = true,
@@ -439,18 +439,21 @@ public class ConsoleManager
     /// Find a standby console by enumerating pipes and querying get_status.
     /// Checks owned pipes for this agent first, then unowned pipes (orphaned by previous proxies).
     /// </summary>
-    private async Task<(int Pid, string DisplayName)?> FindStandbyConsoleAsync(string agentId, string? shellFamily = null)
+    private async Task<(int Pid, string DisplayName)?> FindStandbyConsoleAsync(string agentId, string? shellPath = null)
     {
         // 1. Try owned pipes for this proxy + agent
-        var found = await TryFindInPipesAsync(EnumeratePipes(ProxyPid, agentId), shellFamily);
+        var found = await TryFindInPipesAsync(EnumeratePipes(ProxyPid, agentId), shellPath);
         if (found.HasValue) return found;
 
         // 2. Try unowned pipes (workers whose original proxy died)
-        found = await TryFindInPipesAsync(EnumerateUnownedPipes(), shellFamily);
+        found = await TryFindInPipesAsync(EnumerateUnownedPipes(), shellPath);
         return found;
     }
 
-    private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes, string? shellFamily = null)
+    private static readonly StringComparison PathComparison =
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes, string? shellPath = null)
     {
         foreach (var pipe in pipes)
         {
@@ -466,11 +469,40 @@ public class ConsoleManager
                 var status = response.TryGetProperty("status", out var sp) ? sp.GetString() : null;
                 if (status is not ("standby" or "completed")) continue;
 
-                // Shell family filter: skip consoles that don't match the requested shell
-                var workerShell = response.TryGetProperty("shellFamily", out var sf) ? sf.GetString() : null;
-                if (shellFamily != null && workerShell != null &&
-                    !workerShell.Equals(shellFamily, StringComparison.OrdinalIgnoreCase))
-                    continue;
+                // Shell path filter: match by full path (tracked consoles) or family (unowned)
+                if (shellPath != null)
+                {
+                    bool alreadyTrackedForFilter;
+                    ConsoleInfo? infoForFilter;
+                    lock (_lock)
+                    {
+                        alreadyTrackedForFilter = _consoles.TryGetValue(pid.Value, out infoForFilter);
+                    }
+
+                    if (alreadyTrackedForFilter && infoForFilter != null)
+                    {
+                        // Tracked: match by full path
+                        if (!infoForFilter.ShellPath.Equals(shellPath, PathComparison))
+                            continue;
+                    }
+                    else
+                    {
+                        // Unowned: try full path first, fall back to family
+                        var workerPath = response.TryGetProperty("shellPath", out var spProp) ? spProp.GetString() : null;
+                        if (workerPath != null && workerPath.Length > 0)
+                        {
+                            if (!workerPath.Equals(shellPath, PathComparison))
+                                continue;
+                        }
+                        else
+                        {
+                            var workerShell = response.TryGetProperty("shellFamily", out var sf) ? sf.GetString() : null;
+                            var requestedFamily = NormalizeShellFamily(shellPath);
+                            if (workerShell != null && !workerShell.Equals(requestedFamily, StringComparison.OrdinalIgnoreCase))
+                                continue;
+                        }
+                    }
+                }
 
                 // Already tracked by this proxy — just return it (no re-claim needed)
                 bool alreadyTracked;
@@ -501,7 +533,9 @@ public class ConsoleManager
 
                 lock (_lock)
                 {
-                    _consoles[pid.Value] = new ConsoleInfo(newPipeName, displayNameNew, workerShell ?? "unknown");
+                    var claimShellFamily = response.TryGetProperty("shellFamily", out var sfClaim) ? sfClaim.GetString() ?? "unknown" : "unknown";
+                    var claimShellPath = response.TryGetProperty("shellPath", out var spClaim) ? spClaim.GetString() ?? "" : "";
+                    _consoles[pid.Value] = new ConsoleInfo(newPipeName, displayNameNew, claimShellFamily, claimShellPath);
                 }
 
                 return (pid.Value, displayNameNew);
@@ -847,15 +881,58 @@ public class ConsoleManager
 
     // --- Types ---
 
-    private record ConsoleInfo(string PipePath, string DisplayName, string ShellFamily);
+    private record ConsoleInfo(string PipePath, string DisplayName, string ShellFamily, string ShellPath);
 
     /// <summary>
-    /// Normalize a shell path/name to a canonical family name.
+    /// Normalize a shell path/name to a canonical family name (for display only).
     /// "bash", "/usr/bin/bash", "C:\Windows\System32\bash.exe" → "bash"
     /// "pwsh", "pwsh.exe" → "pwsh"
     /// </summary>
     internal static string NormalizeShellFamily(string shell)
         => Path.GetFileNameWithoutExtension(shell).ToLowerInvariant();
+
+    /// <summary>
+    /// Resolve a shell name to its full path. If already rooted, returns as-is.
+    /// Otherwise searches PATH directories (with PATHEXT on Windows).
+    /// Returns the original string if resolution fails (let CreateProcess handle it).
+    /// </summary>
+    internal static string ResolveShellPath(string shell)
+    {
+        if (Path.IsPathRooted(shell))
+            return Path.GetFullPath(shell);
+
+        var pathDirs = Environment.GetEnvironmentVariable("PATH")
+            ?.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries) ?? [];
+
+        // On Windows, try extensions from PATHEXT (.exe, .cmd, etc.)
+        var extensions = OperatingSystem.IsWindows()
+            ? (Environment.GetEnvironmentVariable("PATHEXT")
+                ?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? [".exe", ".cmd", ".bat"])
+            : [""];
+
+        // If shell already has an extension, try it directly first
+        var hasExtension = Path.HasExtension(shell);
+
+        foreach (var dir in pathDirs)
+        {
+            if (hasExtension)
+            {
+                var fullPath = Path.Combine(dir, shell);
+                if (File.Exists(fullPath))
+                    return Path.GetFullPath(fullPath);
+            }
+
+            foreach (var ext in extensions)
+            {
+                var fullPath = Path.Combine(dir, shell + ext);
+                if (File.Exists(fullPath))
+                    return Path.GetFullPath(fullPath);
+            }
+        }
+
+        // Resolution failed — return as-is
+        return shell;
+    }
 
     public record StartConsoleResult(string Status, int Pid, string DisplayName);
 
