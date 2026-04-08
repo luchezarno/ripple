@@ -101,20 +101,11 @@ public class ConsoleWorker
         // Shell-specific Enter key: Unix shells use \n, Windows shells use \r
         var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
 
-        if (shellName is "pwsh" or "powershell")
+        if (shellName is "pwsh" or "powershell" or "cmd")
         {
-            // pwsh: injection done via -Command in BuildCommandLine.
+            // pwsh/cmd: injection done via BuildCommandLine (-Command / /k prompt).
             // Kick an Enter to trigger the first prompt + OSC markers.
             await WriteToPty(enter, ct);
-        }
-        else if (shellName is "cmd")
-        {
-            // cmd.exe: inject OSC markers via PROMPT environment variable.
-            // $E = ESC, $E\ = ST (String Terminator), $P = current directory, $G = >
-            _mirrorVisible = false;
-            var prompt = @"prompt $E]633;P;Cwd=$P$E\$E]633;A$E\$P$G$S";
-            await WriteToPty(prompt + enter, ct);
-            await Task.Delay(500, ct);
         }
         else
         {
@@ -131,9 +122,9 @@ public class ConsoleWorker
         _ready = true;
         _mirrorVisible = true;
 
-        // For non-pwsh shells, the prompt drawn during injection was suppressed.
-        // Send a kick to make the shell draw a fresh prompt that will be mirrored.
-        if (shellName is not "pwsh" and not "powershell")
+        // For shells with PTY-injected integration (bash/zsh), the prompt drawn
+        // during injection was suppressed. Send a kick to draw a fresh prompt.
+        if (shellName is not "pwsh" and not "powershell" and not "cmd")
         {
             await WriteToPty(enter, ct);
         }
@@ -226,9 +217,13 @@ public class ConsoleWorker
             }
         }
 
-        // cmd.exe: start with /q (quiet echo off) — integration injected via PROMPT in RunAsync
+        // cmd.exe: set PROMPT with OSC 633 markers via /k at startup.
+        // This avoids visible injection echo in the console.
         if (shellName is "cmd")
-            return $"\"{_shell}\" /q";
+        {
+            var prompt = "$E]633;P;Cwd=$P$E\\$E]633;A$E\\$P$G$S";
+            return $"\"{_shell}\" /q /k \"prompt {prompt}\"";
+        }
 
         // bash: use --login -i to load profiles normally; integration is injected
         // later via PTY input by InjectShellIntegration().
@@ -867,7 +862,16 @@ public class ConsoleWorker
     {
         var title = request.TryGetProperty("title", out var tp) ? tp.GetString() : null;
         if (title != null)
+        {
             Console.Title = title;
+            // Also write OSC 0 (Set Window Title) directly to stdout.
+            // Some shells (cmd.exe) override Console.Title via ConPTY;
+            // the OSC 0 sequence ensures the visible console title is set.
+            _stdoutStream ??= Console.OpenStandardOutput();
+            var osc = Encoding.UTF8.GetBytes($"\x1b]0;{title}\x07");
+            _stdoutStream.Write(osc, 0, osc.Length);
+            _stdoutStream.Flush();
+        }
         return SerializeResponse(new { status = "ok" });
     }
 
@@ -900,8 +904,9 @@ public class ConsoleWorker
             sb.Append($"\x1b[33mReason: {reason}\x1b[0m\r\n");
         }
 
-        if (sb.Length > 0)
+        if (sb.Length > 0 && (!string.IsNullOrEmpty(banner) || !string.IsNullOrEmpty(reason)))
         {
+            sb.Append("\r\n"); // blank line after banner before shell output/prompt
             _stdoutStream ??= Console.OpenStandardOutput();
             var bytes = Encoding.UTF8.GetBytes(sb.ToString());
             _stdoutStream.Write(bytes, 0, bytes.Length);

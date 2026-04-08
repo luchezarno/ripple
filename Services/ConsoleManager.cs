@@ -140,6 +140,14 @@ public class ConsoleManager
     private async Task<StartConsoleResult> StartConsoleInnerAsync(string? shell, string? cwd, string? reason, string agentId, string? banner = null)
     {
         var resolvedShell = shell ?? GetDefaultShell();
+
+        // Reject shell values that contain command-line options (e.g., "bash --login -i").
+        // The shell parameter should be a name (bash, pwsh) or a path to the executable.
+        var fileName = Path.GetFileName(resolvedShell);
+        if (fileName.Contains(' '))
+            throw new InvalidOperationException(
+                $"Shell parameter must be a shell name or path, not a command line. Got: '{resolvedShell}'");
+
         var shellFamily = NormalizeShellFamily(resolvedShell);
         bool forceNew = !string.IsNullOrEmpty(reason);
 
