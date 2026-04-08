@@ -876,7 +876,7 @@ public class ConsoleWorker
     /// </summary>
     private void WriteBanner()
     {
-        WriteBannerText(_banner, _reason);
+        WriteBannerText(_banner, _reason, isReuse: false);
     }
 
     /// <summary>
@@ -884,9 +884,11 @@ public class ConsoleWorker
     /// Uses ANSI colors: banner in green, reason in dark yellow.
     /// Shell-agnostic — writes to worker's stdout, not through the shell.
     /// </summary>
-    private void WriteBannerText(string? banner, string? reason)
+    private void WriteBannerText(string? banner, string? reason, bool isReuse = true)
     {
         var sb = new StringBuilder();
+        if (isReuse)
+            sb.Append("\r\n\r\n"); // blank line separating previous prompt from banner
 
         if (!string.IsNullOrEmpty(banner))
             sb.Append($"\x1b[32m{banner}\x1b[0m\r\n");
@@ -911,6 +913,18 @@ public class ConsoleWorker
         var banner = request.TryGetProperty("banner", out var bp) ? bp.GetString() : null;
         var reason = request.TryGetProperty("reason", out var rp) ? rp.GetString() : null;
         WriteBannerText(banner, reason);
+
+        // Kick the shell to draw a fresh prompt after the banner
+        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
+        try
+        {
+            var bytes = Encoding.UTF8.GetBytes(enter);
+            _pty?.InputStream.Write(bytes, 0, bytes.Length);
+            _pty?.InputStream.Flush();
+        }
+        catch { }
+
         return SerializeResponse(new { status = "ok" });
     }
 
