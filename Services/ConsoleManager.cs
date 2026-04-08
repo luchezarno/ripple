@@ -901,16 +901,16 @@ public class ConsoleManager
         if (Path.IsPathRooted(shell))
             return Path.GetFullPath(shell);
 
-        var pathDirs = Environment.GetEnvironmentVariable("PATH")
-            ?.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries) ?? [];
+        // Use the system-registered PATH (registry), not the current process PATH.
+        // The worker is launched with CreateEnvironmentBlock(bInherit=false) which
+        // constructs PATH from registry, so we must resolve against the same source.
+        var pathDirs = GetRegistryPath();
 
-        // On Windows, try extensions from PATHEXT (.exe, .cmd, etc.)
+        // On Windows, try extensions from PATHEXT registry value
         var extensions = OperatingSystem.IsWindows()
-            ? (Environment.GetEnvironmentVariable("PATHEXT")
-                ?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? [".exe", ".cmd", ".bat"])
+            ? GetRegistryPathExt()
             : [""];
 
-        // If shell already has an extension, try it directly first
         var hasExtension = Path.HasExtension(shell);
 
         foreach (var dir in pathDirs)
@@ -932,6 +932,55 @@ public class ConsoleManager
 
         // Resolution failed — return as-is
         return shell;
+    }
+
+    /// <summary>
+    /// Read PATH from Windows registry (System + User), matching what
+    /// CreateEnvironmentBlock produces for child processes.
+    /// Falls back to Environment.GetEnvironmentVariable on non-Windows.
+    /// </summary>
+    private static string[] GetRegistryPath()
+    {
+        if (!OperatingSystem.IsWindows())
+            return Environment.GetEnvironmentVariable("PATH")
+                ?.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries) ?? [];
+
+        try
+        {
+            var systemPath = Microsoft.Win32.Registry.GetValue(
+                @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+                "Path", "") as string ?? "";
+            var userPath = Microsoft.Win32.Registry.GetValue(
+                @"HKEY_CURRENT_USER\Environment",
+                "Path", "") as string ?? "";
+
+            return $"{systemPath};{userPath}"
+                .Split(';', StringSplitOptions.RemoveEmptyEntries);
+        }
+        catch
+        {
+            return Environment.GetEnvironmentVariable("PATH")
+                ?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? [];
+        }
+    }
+
+    /// <summary>
+    /// Read PATHEXT from registry (System environment).
+    /// </summary>
+    private static string[] GetRegistryPathExt()
+    {
+        try
+        {
+            var pathExt = Microsoft.Win32.Registry.GetValue(
+                @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+                "PATHEXT", "") as string ?? "";
+            var result = pathExt.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            return result.Length > 0 ? result : [".exe", ".cmd", ".bat"];
+        }
+        catch
+        {
+            return [".exe", ".cmd", ".bat"];
+        }
     }
 
     public record StartConsoleResult(string Status, int Pid, string DisplayName);
