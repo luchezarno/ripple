@@ -70,11 +70,14 @@ public class ConsoleWorker
         var commandLine = BuildCommandLine();
 
         // Launch shell via platform PTY (ConPTY on Windows, forkpty on Linux/macOS)
+        // Use the visible console's actual dimensions instead of hardcoded 120x30.
         // MSYS2/Git Bash needs the parent's environment (MSYSTEM, HOME, PATH with Git paths).
         // pwsh uses a clean environment to avoid inheriting MCP server variables.
         var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
         bool inheritEnv = shellName is not "pwsh" and not "powershell";
-        _pty = PtyFactory.Start(commandLine, _cwd, inheritEnvironment: inheritEnv);
+        int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
+        int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
+        _pty = PtyFactory.Start(commandLine, _cwd, cols, rows, inheritEnvironment: inheritEnv);
         _writer = _pty.InputStream;
 
         // Start reading PTY output on dedicated thread (feeds OscParser + CommandTracker)
@@ -118,6 +121,9 @@ public class ConsoleWorker
 
         // Start forwarding user's keyboard input from visible console to ConPTY
         var inputTask = InputForwardLoop(ct);
+
+        // Monitor visible console window resizes and propagate to ConPTY
+        var resizeTask = ResizeMonitorLoop(ct);
 
         // Run two pipe servers in parallel:
         //   - owned pipe (SP.{proxyPid}.{agentId}.{ourPid}) for the current proxy
@@ -355,6 +361,34 @@ public class ConsoleWorker
         if (hStdOut == IntPtr.Zero || hStdOut == (IntPtr)(-1)) return;
         if (!GetConsoleMode(hStdOut, out var mode)) return;
         SetConsoleMode(hStdOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+    }
+
+    /// <summary>
+    /// Poll the visible console window size and notify ConPTY when it changes.
+    /// This keeps the shell's COLUMNS/LINES in sync with the actual window.
+    /// </summary>
+    private async Task ResizeMonitorLoop(CancellationToken ct)
+    {
+        int lastCols = 0, lastRows = 0;
+        try { lastCols = Console.WindowWidth; lastRows = Console.WindowHeight; } catch { }
+
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(500, ct);
+            try
+            {
+                int cols = Console.WindowWidth;
+                int rows = Console.WindowHeight;
+                if (cols > 0 && rows > 0 && (cols != lastCols || rows != lastRows))
+                {
+                    lastCols = cols;
+                    lastRows = rows;
+                    _pty?.Resize(cols, rows);
+                    Log($"Resized PTY to {cols}x{rows}");
+                }
+            }
+            catch { }
+        }
     }
 
     /// <summary>
