@@ -274,16 +274,22 @@ public class ConsoleWorker
         }
         else if (OperatingSystem.IsWindows() && shellName is "bash" or "sh")
         {
-            // Git Bash / MSYS2 on Windows — write file directly, then source via PTY.
-            // Heredoc via PTY is unreliable because StringBuilder.AppendLine uses \r\n
-            // on Windows, which corrupts the shell script content.
+            // Bash on Windows — write file directly, then source via PTY.
             var windowsPath = Path.Combine(Path.GetTempPath(), $".shellpilot-integration-{Environment.ProcessId}.sh");
-            // Write with LF-only line endings (Unix format)
-            await File.WriteAllTextAsync(windowsPath, script.Replace("\r\n", "\n"), ct);
-            // Convert Windows path to MSYS path: C:\Users\... → /c/Users/...
-            var msysPath = "/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/');
+            var scriptContent = script.Replace("\r\n", "\n");
+            await File.WriteAllTextAsync(windowsPath, scriptContent, ct);
+
+            // Determine the Unix-style path depending on whether bash is WSL or MSYS2/Git Bash.
+            // WSL: C:\Users\... → /mnt/c/Users/...
+            // MSYS2: C:\Users\... → /c/Users/...
+            var unixPath = IsWslBash(_shell)
+                ? "/mnt/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/')
+                : "/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/');
+
+            Log($"Integration script: {windowsPath} → {unixPath} (exists={File.Exists(windowsPath)}, wsl={IsWslBash(_shell)})");
+
             // bash expects \n for Enter (not \r which pwsh needs)
-            await WriteToPty($"source '{msysPath}'; rm -f '{msysPath}'\n", ct);
+            await WriteToPty($"source '{unixPath}'; rm -f '{unixPath}'\n", ct);
         }
         else
         {
@@ -361,6 +367,44 @@ public class ConsoleWorker
         if (hStdOut == IntPtr.Zero || hStdOut == (IntPtr)(-1)) return;
         if (!GetConsoleMode(hStdOut, out var mode)) return;
         SetConsoleMode(hStdOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+    }
+
+    /// <summary>
+    /// Detect whether the bash executable is WSL bash (vs Git Bash / MSYS2).
+    /// WSL bash: C:\Windows\System32\bash.exe or WindowsApps\bash.exe
+    /// MSYS2/Git Bash: C:\Program Files\Git\usr\bin\bash.exe etc.
+    /// </summary>
+    private static bool IsWslBash(string shellPath)
+    {
+        // If user specified a full path, check it directly
+        if (Path.IsPathRooted(shellPath))
+        {
+            return shellPath.Contains(@"\System32\", StringComparison.OrdinalIgnoreCase) ||
+                   shellPath.Contains(@"\WindowsApps\", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Resolve "bash" via PATH — check which one we'd get
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "where",
+                Arguments = shellPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            var firstLine = proc?.StandardOutput.ReadLine();
+            proc?.WaitForExit();
+            if (firstLine != null)
+            {
+                return firstLine.Contains(@"\System32\", StringComparison.OrdinalIgnoreCase) ||
+                       firstLine.Contains(@"\WindowsApps\", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch { }
+        return false;
     }
 
     /// <summary>
