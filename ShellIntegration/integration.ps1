@@ -1,4 +1,4 @@
-# shellpilot shell integration for PowerShell (pwsh.exe / powershell.exe)
+# splashshell shell integration for PowerShell (pwsh.exe / powershell.exe)
 # Injects OSC 633 escape sequences for command lifecycle tracking.
 # Uses [char] escapes for compatibility with Windows PowerShell 5.1.
 #
@@ -6,8 +6,8 @@
 # through the ConPTY console screen buffer (not Console.Out which is
 # a separate stream in ConPTY environments).
 
-if ($global:__ShellPilotInjected) { return }
-$global:__ShellPilotInjected = $true
+if ($global:__SplashShellInjected) { return }
+$global:__SplashShellInjected = $true
 
 $global:__sp_ESC = [char]0x1B
 $global:__sp_BEL = [char]7

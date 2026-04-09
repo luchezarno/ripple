@@ -1,4 +1,4 @@
-namespace ShellPilot.Services;
+namespace SplashShell.Services;
 
 /// <summary>
 /// Platform-independent PTY session interface.

@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
-namespace ShellPilot.Services;
+namespace SplashShell.Services;
 
 /// <summary>
 /// Unix PTY (forkpty) wrapper for Linux and macOS.

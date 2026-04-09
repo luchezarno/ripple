@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
-namespace ShellPilot.Tests;
+namespace SplashShell.Tests;
 
 /// <summary>
 /// Test: does ConPTY pass OSC 633 sequences through the output pipe?

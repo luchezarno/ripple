@@ -1,6 +1,6 @@
-# shellpilot shell integration for bash
+# splashshell shell integration for bash
 # Injects OSC 633 escape sequences for command lifecycle tracking.
-# Sourced automatically by shellpilot console worker.
+# Sourced automatically by splashshell console worker.
 
 # Guard against double-sourcing
 if [[ "$__SHELLPILOT_INJECTED" == "1" ]]; then

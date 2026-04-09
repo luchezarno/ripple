@@ -3,7 +3,7 @@ using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 
-namespace ShellPilot.Tests;
+namespace SplashShell.Tests;
 
 /// <summary>
 /// E2E test: launch ConsoleWorker in --console mode, send commands via Named Pipe.
@@ -24,7 +24,7 @@ public class ConsoleWorkerTests
 
         Console.WriteLine("=== ConsoleWorker E2E Tests ===");
 
-        // Find shellpilot executable
+        // Find splashshell executable
         var exePath = Process.GetCurrentProcess().MainModule?.FileName;
         if (exePath == null)
         {
@@ -74,7 +74,7 @@ public class ConsoleWorkerTests
 
         // Test 3: execute simple command
         {
-            var command = OperatingSystem.IsWindows() ? "Write-Output 'hello shellpilot'" : "echo 'hello shellpilot'";
+            var command = OperatingSystem.IsWindows() ? "Write-Output 'hello splashshell'" : "echo 'hello splashshell'";
             Console.WriteLine($"  Executing: {command}");
             var resp = await SendRequest(pipeName, new { type = "execute", command, timeout = 10000 }, TimeSpan.FromSeconds(15));
 
@@ -87,7 +87,7 @@ public class ConsoleWorkerTests
             Console.WriteLine($"  ExitCode: {exitCode}, TimedOut: {timedOut}, Cwd: {cwdResult}");
 
             Assert(!timedOut, "Command did not time out");
-            Assert(output.Contains("hello shellpilot"), "Output contains expected text");
+            Assert(output.Contains("hello splashshell"), "Output contains expected text");
             Assert(exitCode == 0, "Exit code is 0");
             Assert(cwdResult != null, "Cwd is reported");
         }

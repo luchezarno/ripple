@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
-namespace ShellPilot.Services;
+namespace SplashShell.Services;
 
 /// <summary>
 /// Console worker process: runs in --console mode.
@@ -19,7 +19,7 @@ public class ConsoleWorker
     // Worker logs go to a file, NOT to Console.Error.
     // The worker's visible console (Console.Out) is reserved for mirroring PTY output.
     // Anything to stderr would also appear there, mixed with PTY data.
-    private static readonly string LogFile = Path.Combine(Path.GetTempPath(), $"shellpilot-worker-{Environment.ProcessId}.log");
+    private static readonly string LogFile = Path.Combine(Path.GetTempPath(), $"splashshell-worker-{Environment.ProcessId}.log");
     private static void Log(string msg) { try { File.AppendAllText(LogFile, $"{DateTime.Now:HH:mm:ss.fff} {msg}\n"); } catch { } }
 
     private string _pipeName;
@@ -211,7 +211,7 @@ public class ConsoleWorker
             var script = LoadEmbeddedScript("integration.ps1");
             if (script != null)
             {
-                var tmpFile = Path.Combine(Path.GetTempPath(), $".shellpilot-integration-{Environment.ProcessId}.ps1");
+                var tmpFile = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1");
                 File.WriteAllText(tmpFile, script);
                 // -NoExit keeps the shell alive after -Command completes.
                 // The command imports PSReadLine + sources the integration script silently.
@@ -287,14 +287,14 @@ public class ConsoleWorker
         // This avoids quoting issues with multi-line heredocs in different shells
         var tmpFile = shellName switch
         {
-            "pwsh" or "powershell" => Path.Combine(Path.GetTempPath(), $".shellpilot-integration-{Environment.ProcessId}.ps1"),
-            _ => $"/tmp/.shellpilot-integration-{Environment.ProcessId}.sh",
+            "pwsh" or "powershell" => Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1"),
+            _ => $"/tmp/.splashshell-integration-{Environment.ProcessId}.sh",
         };
 
         // For Windows paths, use pwsh-compatible approach
         if (OperatingSystem.IsWindows() && shellName is "pwsh" or "powershell")
         {
-            tmpFile = Path.Combine(Path.GetTempPath(), $".shellpilot-integration-{Environment.ProcessId}.ps1");
+            tmpFile = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1");
             // Write file directly from worker process (we share filesystem with shell)
             await File.WriteAllTextAsync(tmpFile, script, ct);
 
@@ -309,7 +309,7 @@ public class ConsoleWorker
         else if (OperatingSystem.IsWindows() && shellName is "bash" or "sh")
         {
             // Bash on Windows — write file directly, then source via PTY.
-            var windowsPath = Path.Combine(Path.GetTempPath(), $".shellpilot-integration-{Environment.ProcessId}.sh");
+            var windowsPath = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.sh");
             var scriptContent = script.Replace("\r\n", "\n");
             await File.WriteAllTextAsync(windowsPath, scriptContent, ct);
 
@@ -340,7 +340,7 @@ public class ConsoleWorker
     private static string? LoadEmbeddedScript(string name)
     {
         var assembly = Assembly.GetExecutingAssembly();
-        var resourceName = $"ShellPilot.ShellIntegration.{name}";
+        var resourceName = $"SplashShell.ShellIntegration.{name}";
         using var stream = assembly.GetManifestResourceStream(resourceName);
         if (stream == null) return null;
         using var reader = new StreamReader(stream);
@@ -1098,7 +1098,7 @@ public class ConsoleWorker
 
         if (proxyPid == null || agentId == null || shell == null)
         {
-            Console.Error.WriteLine("Usage: shellpilot --console --proxy-pid <pid> --agent-id <id> --shell <shell> [--cwd <dir>]");
+            Console.Error.WriteLine("Usage: splash --console --proxy-pid <pid> --agent-id <id> --shell <shell> [--cwd <dir>]");
             return 1;
         }
 

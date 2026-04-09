@@ -1,6 +1,6 @@
-using ShellPilot.Services;
+using SplashShell.Services;
 
-namespace ShellPilot.Tests;
+namespace SplashShell.Tests;
 
 public class OscParserTests
 {

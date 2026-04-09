@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 
-namespace ShellPilot.Services;
+namespace SplashShell.Services;
 
 /// <summary>
 /// Tracks command lifecycle using OSC 633 events.

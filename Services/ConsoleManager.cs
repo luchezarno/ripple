@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
-namespace ShellPilot.Services;
+namespace SplashShell.Services;
 
 /// <summary>
 /// Manages shell console processes via Named Pipe discovery.
@@ -34,8 +34,8 @@ public class ConsoleManager
     public int ProxyPid { get; } = Environment.ProcessId;
 
     // Shared memory for category allocation (same pattern as PowerShell.MCP)
-    private static readonly string SharedMemoryFile = Path.Combine(Path.GetTempPath(), "ShellPilot.AllocatedConsoleCategories.dat");
-    private const string MutexName = "ShellPilot.AllocatedConsoleCategories";
+    private static readonly string SharedMemoryFile = Path.Combine(Path.GetTempPath(), "SplashShell.AllocatedConsoleCategories.dat");
+    private const string MutexName = "SplashShell.AllocatedConsoleCategories";
     private const int MaxEntries = 64;
     private const int EntrySize = 8;        // 4 bytes PID + 4 bytes category index
     private const int HeaderSize = 8;       // 4 bytes magic + 4 bytes count
@@ -196,7 +196,7 @@ public class ConsoleManager
             }
         }
 
-        // Launch shellpilot.exe --console mode with ConPTY.
+        // Launch splash.exe --console mode with ConPTY.
         // Banner/reason passed as CLI args so the worker can display them before the first prompt.
         int pid = _launcher.LaunchConsoleWorker(ProxyPid, agentId, resolvedShell, cwd, banner, reason);
 
@@ -863,7 +863,7 @@ public class ConsoleManager
     // --- Pipe enumeration ---
 
     /// <summary>
-    /// Enumerates shellpilot Named Pipes.
+    /// Enumerates splashshell Named Pipes.
     /// Windows: \\.\pipe\SP.*
     /// Linux/macOS: /tmp/CoreFxPipe_SP.*
     /// </summary>

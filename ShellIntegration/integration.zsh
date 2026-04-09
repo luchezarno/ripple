@@ -1,6 +1,6 @@
-# shellpilot shell integration for zsh
+# splashshell shell integration for zsh
 # Injects OSC 633 escape sequences for command lifecycle tracking.
-# Sourced automatically by shellpilot console worker.
+# Sourced automatically by splashshell console worker.
 
 if [[ "$__SHELLPILOT_INJECTED" == "1" ]]; then
     return

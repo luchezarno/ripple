@@ -6,12 +6,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <AssemblyName>shellpilot</AssemblyName>
-    <RootNamespace>ShellPilot</RootNamespace>
+    <AssemblyName>splash</AssemblyName>
+    <RootNamespace>SplashShell</RootNamespace>
     <Version>0.1.0</Version>
     <Authors>Yoshifumi Tsuda</Authors>
     <Company>Yoshifumi Tsuda</Company>
-    <Product>shellpilot</Product>
+    <Product>splashshell</Product>
     <Description>Universal MCP server that exposes any shell (bash, pwsh, cmd) over ConPTY</Description>
     <Copyright>Copyright (c) 2026 Yoshifumi Tsuda</Copyright>
   </PropertyGroup>

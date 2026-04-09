@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Build shellpilot. Stops any running shellpilot.exe first.
+    Build splashshell. Stops any running splash.exe first.
 .PARAMETER Configuration
     Build configuration (Debug or Release). Default: Debug.
 .PARAMETER Publish
@@ -21,13 +21,13 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $ProjectRoot = $PSScriptRoot
-$ProjectFile = Join-Path $ProjectRoot 'shellpilot.csproj'
+$ProjectFile = Join-Path $ProjectRoot 'splashshell.csproj'
 
-Write-Host '=== shellpilot Build ===' -ForegroundColor Cyan
+Write-Host '=== splashshell Build ===' -ForegroundColor Cyan
 
-# Step 1: Stop running shellpilot processes
-Write-Host "`n[1/2] Stopping running shellpilot.exe processes..." -ForegroundColor Yellow
-$processes = @(Get-Process -Name 'shellpilot' -ErrorAction Ignore)
+# Step 1: Stop running splashshell processes
+Write-Host "`n[1/2] Stopping running splash.exe processes..." -ForegroundColor Yellow
+$processes = @(Get-Process -Name 'splash' -ErrorAction Ignore)
 if ($processes.Count -gt 0) {
     $processes | Stop-Process -Force
     Start-Sleep -Milliseconds 500

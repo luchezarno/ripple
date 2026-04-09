@@ -2,10 +2,10 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
-using ShellPilot.Services;
-using ShellPilot.Tools;
+using SplashShell.Services;
+using SplashShell.Tools;
 
-namespace ShellPilot;
+namespace SplashShell;
 
 public class Program
 {
