@@ -76,15 +76,17 @@ public class ConsoleWorker
         // Shell-specific Enter key: pwsh needs \r, bash/zsh need \n
         var enter = shellName is "pwsh" or "powershell" ? "\r" : "\n";
 
-        if (shellName is not "pwsh" and not "powershell")
+        if (shellName is "pwsh" or "powershell" or "bash" or "sh")
         {
-            await InjectShellIntegration(ct);
-            await Task.Delay(500, ct);
+            // Injection done via BuildCommandLine (--rcfile / -Command).
+            // Just kick an Enter to trigger the first prompt + OSC markers.
             await WriteToPty(enter, ct);
         }
         else
         {
-            // pwsh: injection was done via -Command, just kick to trigger prompt
+            // zsh and others: inject via PTY input after startup
+            await InjectShellIntegration(ct);
+            await Task.Delay(500, ct);
             await WriteToPty(enter, ct);
         }
 
@@ -166,9 +168,32 @@ public class ConsoleWorker
             }
         }
 
-        // For bash/zsh, add interactive flags
+        // For bash: use --rcfile to inject shell integration silently (no echo).
+        // The rcfile sources the user's normal profiles first, then the integration script.
         if (shellName is "bash" or "sh")
+        {
+            var script = LoadEmbeddedScript("integration.bash");
+            if (script != null)
+            {
+                var tmpFile = Path.Combine(Path.GetTempPath(), $".shellpilot-rcfile-{Environment.ProcessId}.sh");
+                // Convert to MSYS path for Git Bash on Windows
+                var msysPath = OperatingSystem.IsWindows()
+                    ? "/" + char.ToLower(tmpFile[0]) + tmpFile[2..].Replace('\\', '/')
+                    : tmpFile;
+
+                // Build rcfile: load user profiles, then integration, then self-delete
+                var rcContent = $@"
+[ -f /etc/profile ] && . /etc/profile 2>/dev/null
+[ -f ~/.bash_profile ] && . ~/.bash_profile 2>/dev/null || [ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null
+{script}
+rm -f '{msysPath}'
+";
+                File.WriteAllText(tmpFile, rcContent.Replace("\r\n", "\n"));
+                return $"\"{_shell}\" --rcfile \"{msysPath}\" -i";
+            }
             return $"\"{_shell}\" --login -i";
+        }
+
         if (shellName is "zsh")
             return $"\"{_shell}\" -l -i";
 
