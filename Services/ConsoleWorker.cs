@@ -47,6 +47,9 @@ public class ConsoleWorker
 
     private readonly string? _banner;
     private readonly string? _reason;
+    // Title set by proxy via set_title. Used to override OSC 0 title sequences
+    // emitted by shells (e.g., bash's PROMPT_COMMAND sets "user@host: cwd").
+    private volatile string? _desiredTitle;
 
     public ConsoleWorker(string pipeName, int proxyPid, string shell, string cwd, string? banner = null, string? reason = null)
     {
@@ -716,10 +719,16 @@ public class ConsoleWorker
                         {
                             try
                             {
+                                // Replace any OSC 0 (set window title) sequences emitted by
+                                // the shell with our desired title, so the title stays as
+                                // "#PID Name" instead of being overridden by e.g. bash's
+                                // "user@host: cwd" prompt title.
+                                var cleanedOutput = ReplaceOscTitle(result.Cleaned, _desiredTitle);
+
                                 // Write directly to stdout as raw UTF-8 bytes — bypasses
                                 // any TextWriter buffering and preserves the exact byte
                                 // sequence (including \b, \e[K) for atomic console processing.
-                                var outBytes = Encoding.UTF8.GetBytes(result.Cleaned);
+                                var outBytes = Encoding.UTF8.GetBytes(cleanedOutput);
                                 _stdoutStream ??= Console.OpenStandardOutput();
                                 _stdoutStream.Write(outBytes, 0, outBytes.Length);
                                 _stdoutStream.Flush();
@@ -870,11 +879,57 @@ public class ConsoleWorker
         });
     }
 
+    /// <summary>
+    /// Replace OSC 0/1/2 (set window title) sequences in shell output with our
+    /// desired title. Prevents shells like bash from overriding the title set
+    /// by the proxy via set_title pipe command.
+    /// Format: \x1b]N;text\x07 (BEL terminator) or \x1b]N;text\x1b\\ (ST terminator)
+    /// where N is 0, 1, or 2.
+    /// </summary>
+    private static string ReplaceOscTitle(string input, string? desiredTitle)
+    {
+        if (desiredTitle == null) return input;
+
+        var sb = new StringBuilder(input.Length);
+        int i = 0;
+        while (i < input.Length)
+        {
+            // Look for \x1b](0|1|2);
+            if (i + 3 < input.Length && input[i] == '\x1b' && input[i + 1] == ']' &&
+                (input[i + 2] == '0' || input[i + 2] == '1' || input[i + 2] == '2') && input[i + 3] == ';')
+            {
+                // Find terminator: BEL (\x07) or ST (\x1b\)
+                int end = -1;
+                int termLen = 0;
+                for (int j = i + 4; j < input.Length; j++)
+                {
+                    if (input[j] == '\x07') { end = j; termLen = 1; break; }
+                    if (input[j] == '\x1b' && j + 1 < input.Length && input[j + 1] == '\\')
+                    { end = j; termLen = 2; break; }
+                }
+
+                if (end > 0)
+                {
+                    // Replace with our desired title (preserve the OSC type and terminator style)
+                    sb.Append('\x1b').Append(']').Append(input[i + 2]).Append(';').Append(desiredTitle);
+                    if (termLen == 1) sb.Append('\x07');
+                    else { sb.Append('\x1b').Append('\\'); }
+                    i = end + termLen;
+                    continue;
+                }
+            }
+            sb.Append(input[i]);
+            i++;
+        }
+        return sb.ToString();
+    }
+
     private JsonElement HandleSetTitle(JsonElement request)
     {
         var title = request.TryGetProperty("title", out var tp) ? tp.GetString() : null;
         if (title != null)
         {
+            _desiredTitle = title;
             Console.Title = title;
             // Also write OSC 0 (Set Window Title) directly to stdout.
             // Some shells (cmd.exe) override Console.Title via ConPTY;
