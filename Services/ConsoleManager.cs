@@ -945,7 +945,7 @@ public class ConsoleManager
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            var envShell = Environment.GetEnvironmentVariable("SHELLPILOT_SHELL");
+            var envShell = Environment.GetEnvironmentVariable("SPLASHSHELL_SHELL");
             if (!string.IsNullOrEmpty(envShell)) return envShell;
             return "pwsh.exe";
         }

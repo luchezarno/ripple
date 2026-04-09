@@ -3,10 +3,10 @@
 # Sourced automatically by splashshell console worker.
 
 # Guard against double-sourcing
-if [[ "$__SHELLPILOT_INJECTED" == "1" ]]; then
+if [[ "$__SPLASHSHELL_INJECTED" == "1" ]]; then
     return
 fi
-__SHELLPILOT_INJECTED=1
+__SPLASHSHELL_INJECTED=1
 
 # Save original PROMPT_COMMAND
 __sp_original_prompt_command="$PROMPT_COMMAND"

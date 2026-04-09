@@ -2,10 +2,10 @@
 # Injects OSC 633 escape sequences for command lifecycle tracking.
 # Sourced automatically by splashshell console worker.
 
-if [[ "$__SHELLPILOT_INJECTED" == "1" ]]; then
+if [[ "$__SPLASHSHELL_INJECTED" == "1" ]]; then
     return
 fi
-__SHELLPILOT_INJECTED=1
+__SPLASHSHELL_INJECTED=1
 
 __sp_osc() {
     printf '\e]633;%s\a' "$1"

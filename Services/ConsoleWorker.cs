@@ -329,9 +329,9 @@ public class ConsoleWorker
         {
             // Linux/macOS
             var injection = new StringBuilder();
-            injection.AppendLine($"cat > {tmpFile} << 'SHELLPILOT_EOF'");
+            injection.AppendLine($"cat > {tmpFile} << 'SPLASHSHELL_EOF'");
             injection.AppendLine(script.TrimEnd());
-            injection.AppendLine("SHELLPILOT_EOF");
+            injection.AppendLine("SPLASHSHELL_EOF");
             injection.AppendLine($"source {tmpFile}; rm -f {tmpFile}");
             await WriteToPty(injection.ToString(), ct);
         }
