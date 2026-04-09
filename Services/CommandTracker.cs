@@ -47,6 +47,10 @@ public class CommandTracker
     // Cached result from timed-out commands
     private CommandResult? _cachedResult;
 
+    // Last known cwd from any prompt (AI command or user command)
+    private string? _lastKnownCwd;
+    public string? LastKnownCwd { get { lock (_lock) return _lastKnownCwd; } }
+
     public bool Busy => _isAiCommand;
     public bool HasCachedOutput => _cachedResult != null;
 
@@ -102,6 +106,10 @@ public class CommandTracker
     {
         lock (_lock)
         {
+            // Always track cwd, even outside AI commands (for user manual cd)
+            if (evt.Type == OscParser.OscEventType.Cwd)
+                _lastKnownCwd = evt.Cwd;
+
             if (!_isAiCommand) return;
 
             switch (evt.Type)

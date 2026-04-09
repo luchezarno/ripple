@@ -159,10 +159,35 @@ public class ConsoleManager
             {
                 lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
 
+                var reusePipe = _consoles.GetValueOrDefault(standby.Value.Pid)?.PipePath;
+
+                // If cwd was explicitly specified, cd the reused console to it
+                if (!string.IsNullOrEmpty(cwd) && reusePipe != null)
+                {
+                    var cdPreamble = BuildCdPreamble(shellFamily, cwd);
+                    if (cdPreamble != null)
+                    {
+                        try
+                        {
+                            await SendPipeRequestAsync(reusePipe, new
+                            {
+                                type = "execute",
+                                command = cdPreamble.TrimEnd('&', ' '), // strip trailing && for standalone cd
+                                timeout = 5000,
+                            }, TimeSpan.FromSeconds(8));
+                            lock (_lock)
+                            {
+                                var info = _consoles.GetValueOrDefault(standby.Value.Pid);
+                                if (info != null) info.LastAiCwd = cwd;
+                            }
+                        }
+                        catch { /* best-effort */ }
+                    }
+                }
+
                 // Display banner on reused console via pipe
                 if (!string.IsNullOrEmpty(banner) || !string.IsNullOrEmpty(reason))
                 {
-                    var reusePipe = _consoles.GetValueOrDefault(standby.Value.Pid)?.PipePath;
                     if (reusePipe != null)
                         try { await SendPipeRequestAsync(reusePipe, new { type = "display_banner", banner, reason }, TimeSpan.FromSeconds(3)); } catch { }
                 }
@@ -184,6 +209,18 @@ public class ConsoleManager
         }
 
         await WaitForPipeReadyAsync(pipeName, TimeSpan.FromSeconds(30));
+
+        // Query the worker for the actual cwd in shell-native format
+        // (e.g., /mnt/c/foo for WSL bash, C:\foo for pwsh).
+        var initialCwd = await QueryConsoleCwdAsync(pipeName);
+        if (initialCwd != null)
+        {
+            lock (_lock)
+            {
+                var info = _consoles.GetValueOrDefault(pid);
+                if (info != null) info.LastAiCwd = initialCwd;
+            }
+        }
 
         try { await SendPipeRequestAsync(pipeName, new { type = "set_title", title = displayName }, TimeSpan.FromSeconds(3)); }
         catch { /* best-effort */ }
@@ -207,12 +244,16 @@ public class ConsoleManager
         // Resolve shell to full path for consistent matching
         var resolvedShell = shell != null ? ResolveShellPath(shell) : null;
 
+        int initialActivePid;
         int consolePid;
         string pipeName;
+        string? sourceShellFamily;
 
         lock (_lock)
         {
-            consolePid = GetOrCreateAgentState(agentId).ActivePid;
+            initialActivePid = GetOrCreateAgentState(agentId).ActivePid;
+            consolePid = initialActivePid;
+            sourceShellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
 
             // Check if active console matches the requested shell (by full path)
             if (consolePid != 0 && resolvedShell != null)
@@ -227,32 +268,118 @@ public class ConsoleManager
                 : "";
         }
 
-        // No active console, or active console is wrong shell type → switch
+        // Query the active console's status: get cwd (for cd preamble) and detect busy.
+        // If busy, treat it like the active console is unavailable → trigger switch.
+        string? sourceCwd = null;
+        bool activeBusy = false;
+        if (initialActivePid != 0 && IsProcessAlive(initialActivePid))
+        {
+            string? sourcePipe;
+            lock (_lock) sourcePipe = _consoles.GetValueOrDefault(initialActivePid)?.PipePath;
+            if (sourcePipe != null)
+            {
+                try
+                {
+                    var statusResp = await SendPipeRequestAsync(sourcePipe,
+                        new { type = "get_status" }, TimeSpan.FromSeconds(3));
+                    sourceCwd = statusResp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
+                    var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
+                    activeBusy = statusStr == "busy";
+                }
+                catch { }
+            }
+        }
+
+        // If the active console is busy, force a switch to another console
+        if (activeBusy && consolePid == initialActivePid)
+            consolePid = 0;
+
+        bool isSwitching = false;
+
+        // No active console, or active console is wrong shell type, or busy → switch or auto-start
         if (consolePid == 0 || !IsProcessAlive(consolePid))
         {
-            string switchedDisplayName;
+            isSwitching = true;
 
-            // Try to find a standby matching the resolved shell path
             var standby = await FindStandbyConsoleAsync(agentId, resolvedShell);
             if (standby != null)
             {
-                lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
-                switchedDisplayName = standby.Value.DisplayName;
+                consolePid = standby.Value.Pid;
+                lock (_lock)
+                {
+                    GetOrCreateAgentState(agentId).ActivePid = consolePid;
+                    pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid);
+                }
             }
             else
             {
-                // No standby — auto-start a new console
-                var startResult = await StartConsoleInnerAsync(shell ?? GetDefaultShell(), null, null, agentId);
-                switchedDisplayName = startResult.DisplayName;
+                // Auto-start a new console, seeding it with the source console's cwd.
+                // StartConsoleInnerAsync queries the worker for the actual cwd
+                // in shell-native format and stores it in LastAiCwd.
+                var startResult = await StartConsoleInnerAsync(shell ?? GetDefaultShell(), sourceCwd, null, agentId);
+                consolePid = startResult.Pid;
+                lock (_lock)
+                    pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid);
             }
+        }
 
-            // Don't execute — cwd may differ. Let the caller re-execute.
+        // Determine target shell family and check cross-shell compatibility for cd preamble
+        string? targetShellFamily;
+        lock (_lock) targetShellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
+
+        bool sameShellFamily = sourceShellFamily != null && targetShellFamily != null &&
+                                sourceShellFamily.Equals(targetShellFamily, StringComparison.OrdinalIgnoreCase);
+
+        if (isSwitching && sourceCwd != null && sameShellFamily)
+        {
+            // Switching to a same-shell console: prepend cd preamble so the user's
+            // command runs in the source cwd. This makes switching transparent.
+            var cdPreamble = BuildCdPreamble(targetShellFamily!, sourceCwd);
+            if (cdPreamble != null)
+            {
+                command = cdPreamble + command;
+                lock (_lock)
+                {
+                    var info = _consoles.GetValueOrDefault(consolePid);
+                    if (info != null) info.LastAiCwd = sourceCwd;
+                }
+            }
+        }
+        else if (isSwitching)
+        {
+            // Cross-shell switch (or no source cwd): cannot auto-cd. Warn user.
+            var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             return new ExecuteResult
             {
                 Switched = true,
-                DisplayName = switchedDisplayName,
-                Output = $"Switched to console {switchedDisplayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
+                DisplayName = displayName,
+                Output = $"Switched to console {displayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
             };
+        }
+        else
+        {
+            // Same console — check if user manually cd'd since the last AI command
+            var currentCwd = await QueryConsoleCwdAsync(pipeName);
+            string? lastAiCwd;
+            ConsoleInfo? consoleInfo;
+            lock (_lock)
+            {
+                consoleInfo = _consoles.GetValueOrDefault(consolePid);
+                lastAiCwd = consoleInfo?.LastAiCwd;
+            }
+
+            if (currentCwd != null && lastAiCwd != null &&
+                !currentCwd.Equals(lastAiCwd, PathComparison))
+            {
+                lock (_lock) { if (consoleInfo != null) consoleInfo.LastAiCwd = currentCwd; }
+                var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
+                return new ExecuteResult
+                {
+                    Switched = true,
+                    DisplayName = displayName,
+                    Output = $"Console {displayName} cwd is now '{currentCwd}' (was '{lastAiCwd}'). Pipeline NOT executed — verify and re-execute.",
+                };
+            }
         }
 
         try
@@ -280,6 +407,13 @@ public class ConsoleManager
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
             var displayName2 = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+
+            // Update LastAiCwd with the result cwd (the cwd the command ended at)
+            lock (_lock)
+            {
+                var info2 = _consoles.GetValueOrDefault(consolePid);
+                if (info2 != null && cwdResult != null) info2.LastAiCwd = cwdResult;
+            }
 
             return new ExecuteResult
             {
@@ -556,6 +690,37 @@ public class ConsoleManager
     /// Collect cached outputs from all owned consoles (single scan, no polling).
     /// Called from every MCP tool to drain completed background commands.
     /// </summary>
+    /// <summary>
+    /// Build a shell-specific "cd 'path' && " preamble that can be prepended to a command.
+    /// Returns null if the shell family is not supported.
+    /// </summary>
+    private static string? BuildCdPreamble(string shellFamily, string cwd)
+    {
+        return shellFamily.ToLowerInvariant() switch
+        {
+            "bash" or "sh" or "zsh" => $"cd '{cwd.Replace("'", "'\\''")}' && ",
+            "pwsh" or "powershell" => $"Set-Location '{cwd.Replace("'", "''")}'; ",
+            "cmd" => $"cd /d \"{cwd.Replace("\"", "\"\"")}\" && ",
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Query a console's current cwd via get_status pipe command.
+    /// Returns null if the query fails or the worker doesn't have a tracked cwd yet.
+    /// </summary>
+    private async Task<string?> QueryConsoleCwdAsync(string pipeName)
+    {
+        try
+        {
+            var resp = await SendPipeRequestAsync(pipeName,
+                new { type = "get_status" },
+                TimeSpan.FromSeconds(3));
+            return resp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
+        }
+        catch { return null; }
+    }
+
     /// <summary>
     /// Detect consoles that have been closed since the last check.
     /// Removes them from _consoles and returns their display names + shell families.
@@ -912,7 +1077,12 @@ public class ConsoleManager
 
     // --- Types ---
 
-    private record ConsoleInfo(string PipePath, string DisplayName, string ShellFamily, string ShellPath);
+    private record ConsoleInfo(string PipePath, string DisplayName, string ShellFamily, string ShellPath)
+    {
+        // Cwd as of the most recent AI command. Used to detect manual user cd
+        // and to skip the "NOT executed" warning when cwd is consistent.
+        public string? LastAiCwd { get; set; }
+    }
 
     /// <summary>
     /// Normalize a shell path/name to a canonical family name (for display only).

@@ -798,7 +798,7 @@ public class ConsoleWorker
         return type switch
         {
             "execute" => await HandleExecuteAsync(request, ct),
-            "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput, shellFamily = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant(), shellPath = _shell }),
+            "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput, shellFamily = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant(), shellPath = _shell, cwd = _tracker.LastKnownCwd }),
             "get_cached_output" => HandleGetCachedOutput(),
             "set_title" => HandleSetTitle(request),
             "display_banner" => HandleDisplayBanner(request),
