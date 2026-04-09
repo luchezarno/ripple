@@ -79,8 +79,8 @@ public class ConsoleWorker
         if (shellName is "pwsh" or "powershell" or "bash" or "sh")
         {
             // Injection done via BuildCommandLine (--rcfile / -Command).
-            // Just kick an Enter to trigger the first prompt + OSC markers.
-            await WriteToPty(enter, ct);
+            // The shell integration emits OSC markers on the first natural prompt,
+            // no kick needed.
         }
         else
         {
