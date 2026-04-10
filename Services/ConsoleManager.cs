@@ -22,7 +22,6 @@ public class ConsoleManager
     private readonly SemaphoreSlim _toolLock = new(1, 1);
     private readonly Dictionary<int, ConsoleInfo> _consoles = new();
     private readonly Dictionary<string, AgentSessionState> _agentSessions = new();
-    private readonly HashSet<string> _allocatedSubAgentIds = new();
 
     // Category naming
     private readonly int _categoryIndex;
@@ -115,15 +114,12 @@ public class ConsoleManager
 
     public string AllocateSubAgentId()
     {
-        lock (_lock)
-        {
-            string id;
-            do
-            {
-                id = $"sa-{Guid.NewGuid():N}"[..11];
-            } while (!_allocatedSubAgentIds.Add(id));
-            return id;
-        }
+        // 8 hex chars from a v4 GUID = 32 bits of entropy. Collisions across a
+        // single proxy's lifetime are vanishingly unlikely, and if one ever
+        // happens the two sub-agents land on the same AgentSessionState bucket
+        // — the same failure mode as if the caller passed a duplicate agent_id
+        // manually. No tracking table needed.
+        return $"sa-{Guid.NewGuid():N}"[..11];
     }
 
     /// <summary>
@@ -501,9 +497,6 @@ public class ConsoleManager
     public static string GetPipeName(string agentId, int consolePid)
         => $"{PipePrefix}.{Environment.ProcessId}.{agentId}.{consolePid}";
 
-    public static string GetPipePath(string agentId, int consolePid)
-        => GetPipeName(agentId, consolePid);
-
     private async Task<JsonElement> SendPipeRequestAsync(string pipeName, Action<Utf8JsonWriter> writeBody, TimeSpan timeout)
     {
         using var cts = new CancellationTokenSource(timeout);
@@ -527,28 +520,6 @@ public class ConsoleManager
         await ReadExactAsync(client, recvBytes, cts.Token);
 
         return PipeJson.ParseElement(recvBytes);
-    }
-
-    /// <summary>
-    /// Display banner and/or reason text in a console's visible window.
-    /// Writes directly to the worker's stdout via pipe command (shell-agnostic).
-    /// </summary>
-    public async Task DisplayBannerAsync(int consolePid, string? banner, string? reason)
-    {
-        string? pipeName;
-        lock (_lock) pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath;
-        if (pipeName == null) return;
-
-        try
-        {
-            await SendPipeRequestAsync(pipeName, w =>
-            {
-                w.WriteString("type", "display_banner");
-                w.WriteStringOrNull("banner", banner);
-                w.WriteStringOrNull("reason", reason);
-            }, TimeSpan.FromSeconds(3));
-        }
-        catch { /* best-effort */ }
     }
 
     private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
