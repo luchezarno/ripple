@@ -53,3 +53,11 @@ function global:prompt {
 
 # Emit initial CommandInputStart marker via Write-Host (goes to console screen buffer)
 Write-Host -NoNewline (__sp_osc_str "B")
+
+# Override Enter to emit OSC B (CommandInputStart) after AcceptLine rendering.
+# AcceptLine() runs first (PSReadLine redraws), then OSC B signals the worker
+# to discard the rendering noise and start capturing clean command output.
+Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    Write-Host -NoNewline (__sp_osc_str "B")
+}

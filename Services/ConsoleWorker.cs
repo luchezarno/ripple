@@ -1,4 +1,4 @@
-using System.IO.Pipes;
+﻿using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -732,6 +732,9 @@ public class ConsoleWorker
                             _ready = true;
                             _readyEvent.Set();
                         }
+                        // Re-enable PTY mirroring when PSReadLine signals command execution start
+                        if (_ready && evt.Type == OscParser.OscEventType.CommandInputStart)
+                            _mirrorVisible = true;
                     }
 
                     if (result.Cleaned.Length > 0)
@@ -855,13 +858,28 @@ public class ConsoleWorker
         if (_tracker.Busy)
             return SerializeResponse(new { status = "busy", command });
 
-        // Register command with tracker (it will resolve when OSC PromptStart arrives)
-        var resultTask = _tracker.RegisterCommand(command, timeoutMs);
-
         // Write command to PTY
         // Shell-specific Enter: pwsh → \r, bash/zsh → \n
         var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
         var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
+
+        // For pwsh: suppress PTY mirroring while PSReadLine renders prediction noise,
+        // and display the command directly in the visible console.
+        // OSC B (emitted by the Enter key handler in integration.ps1) re-enables
+        // mirroring and starts output capture.
+        if (shellName is "pwsh" or "powershell")
+        {
+            _mirrorVisible = false;
+            _stdoutStream ??= Console.OpenStandardOutput();
+            var cmdDisplay = Encoding.UTF8.GetBytes(command + "\r\n");
+            _stdoutStream.Write(cmdDisplay, 0, cmdDisplay.Length);
+            _stdoutStream.Flush();
+            _tracker.SuppressUntilCommandStart();
+        }
+
+        // Register command with tracker (it will resolve when OSC PromptStart arrives)
+        var resultTask = _tracker.RegisterCommand(command, timeoutMs);
+
         await WriteToPty(command + enter, ct);
 
         try

@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text.RegularExpressions;
 
 namespace SplashShell.Services;
@@ -41,6 +41,7 @@ public class CommandTracker
     private int _exitCode;
     private string? _cwd;
     private string _commandSent = "";
+    private bool _captureEnabled = true;
     private Stopwatch? _stopwatch;
     private CancellationTokenSource? _settleCts;
 
@@ -100,6 +101,23 @@ public class CommandTracker
     }
 
     /// <summary>
+    /// Suppress output capture until CommandInputStart (OSC B) arrives.
+    /// Called for pwsh to discard PSReadLine prediction rendering noise.
+    /// Safety timer re-enables capture after 2s if OSC B never arrives.
+    /// </summary>
+    public void SuppressUntilCommandStart()
+    {
+        lock (_lock)
+        {
+            _captureEnabled = false;
+            _ = Task.Delay(2000).ContinueWith(_ =>
+            {
+                lock (_lock) { if (!_captureEnabled) _captureEnabled = true; }
+            });
+        }
+    }
+
+    /// <summary>
     /// Feed an OSC event from the parser.
     /// </summary>
     public void HandleEvent(OscParser.OscEvent evt)
@@ -114,6 +132,11 @@ public class CommandTracker
 
             switch (evt.Type)
             {
+                case OscParser.OscEventType.CommandInputStart:
+                    _captureEnabled = true;
+                    _output = "";  // discard PSReadLine prediction noise before OSC B
+                    break;
+
                 case OscParser.OscEventType.CommandFinished:
                     _exitCode = evt.ExitCode;
                     break;
@@ -136,7 +159,7 @@ public class CommandTracker
     {
         lock (_lock)
         {
-            if (!_isAiCommand) return;
+            if (!_isAiCommand || !_captureEnabled) return;
 
             if (_output.Length < MaxOutputBytes)
             {
@@ -215,26 +238,23 @@ public class CommandTracker
         output = PwshPromptInline.Replace(output, "");
         var lines = output.Split('\n');
         var cleaned = new List<string>();
-        bool echoSkipped = false;
 
-        foreach (var rawLine in lines)
+        // Find where actual output starts by locating the command echo line.
+        // With OSC B gating: _output is clean but AcceptLine() still renders the command.
+        // Without OSC B (fallback): _output may contain PSReadLine noise before the echo.
+        // In both cases, we find the last line matching _commandSent (or its prefix),
+        // and start capturing from after it.
+        int startLine = FindPostEchoLine(lines);
+
+        for (int i = startLine; i < lines.Length; i++)
         {
-            var line = rawLine.TrimEnd('\r');
+            var line = lines[i].TrimEnd('\r');
 
             // Skip pwsh continuation prompt ">>" (with or without trailing space)
             var trimmed = line.TrimEnd();
             if (trimmed == ">>" || trimmed.StartsWith(">> "))
                 continue;
 
-            if (!echoSkipped)
-            {
-                // Skip the command echo line and any blank lines before it
-                if (line.Contains(_commandSent) || string.IsNullOrWhiteSpace(line))
-                {
-                    echoSkipped = true;
-                    continue;
-                }
-            }
             cleaned.Add(line);
         }
 
@@ -255,6 +275,40 @@ public class CommandTracker
         if (_truncated)
             result += "\n\n[Output truncated at 1MB]";
         return result;
+    }
+
+    /// <summary>
+    /// Find the line index to start capturing from, by locating the command echo.
+    /// Returns the index of the first line AFTER the echo.
+    /// </summary>
+    private int FindPostEchoLine(string[] lines)
+    {
+        if (string.IsNullOrEmpty(_commandSent)) return 0;
+
+        // Strategy 1: exact match — handles short commands that fit on one terminal line
+        for (int i = 0; i < lines.Length; i++)
+            if (lines[i].Contains(_commandSent))
+                return i + 1;
+
+        // Strategy 2: prefix match — handles long commands wrapped at terminal width.
+        // AcceptLine() may render the command in multiple partial passes;
+        // take the LAST matching line so we start after the final render.
+        if (_commandSent.Length >= 20)
+        {
+            var prefix = _commandSent[..20];
+            int lastMatch = -1;
+            for (int i = 0; i < lines.Length; i++)
+                if (lines[i].Contains(prefix))
+                    lastMatch = i;
+            if (lastMatch >= 0) return lastMatch + 1;
+        }
+
+        // Strategy 3: fallback — first blank line (original behavior)
+        for (int i = 0; i < lines.Length; i++)
+            if (string.IsNullOrWhiteSpace(lines[i]))
+                return i + 1;
+
+        return 0;
     }
 
     /// <summary>
@@ -283,6 +337,7 @@ public class CommandTracker
         _output = "";
         _commandSent = "";
         _stopwatch = null;
+        _captureEnabled = true;
     }
 
     private static string StripAnsi(string text) => AnsiRegex.Replace(text, "");
