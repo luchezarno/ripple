@@ -722,6 +722,7 @@ public class ConsoleWorker
                     if (read == 0) break;
 
                     var text = Encoding.UTF8.GetString(buffer, 0, read);
+                    if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);
 
                     foreach (var evt in result.Events)
@@ -832,18 +833,25 @@ public class ConsoleWorker
     {
         var type = request.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
         if (type == null)
-            return SerializeResponse(new { error = "Missing 'type' field in request" });
+            return SerializeResponse(w => w.WriteString("error", "Missing 'type' field in request"));
 
         return type switch
         {
             "execute" => await HandleExecuteAsync(request, ct),
-            "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput, shellFamily = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant(), shellPath = _shell, cwd = _tracker.LastKnownCwd }),
+            "get_status" => SerializeResponse(w =>
+            {
+                w.WriteString("status", Status);
+                w.WriteBoolean("hasCachedOutput", _tracker.HasCachedOutput);
+                w.WriteString("shellFamily", Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant());
+                w.WriteString("shellPath", _shell);
+                w.WriteStringOrNull("cwd", _tracker.LastKnownCwd);
+            }),
             "get_cached_output" => HandleGetCachedOutput(),
             "set_title" => HandleSetTitle(request),
             "display_banner" => HandleDisplayBanner(request),
             "claim" => HandleClaim(request),
-            "ping" => SerializeResponse(new { status = "ok" }),
-            _ => SerializeResponse(new { error = $"Unknown request type: {type}" }),
+            "ping" => SerializeResponse(w => w.WriteString("status", "ok")),
+            _ => SerializeResponse(w => w.WriteString("error", $"Unknown request type: {type}")),
         };
     }
 
@@ -851,12 +859,12 @@ public class ConsoleWorker
     {
         var command = request.TryGetProperty("command", out var cmdProp) ? cmdProp.GetString() ?? "" : "";
         if (string.IsNullOrEmpty(command))
-            return SerializeResponse(new { error = "Missing 'command' field in request" });
+            return SerializeResponse(w => w.WriteString("error", "Missing 'command' field in request"));
         var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : 170_000;
 
         // Reject if another command is still running (e.g., timed-out command in background)
         if (_tracker.Busy)
-            return SerializeResponse(new { status = "busy", command });
+            return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
 
         // Write command to PTY
         // Shell-specific Enter: pwsh → \r, bash/zsh → \n
@@ -885,24 +893,24 @@ public class ConsoleWorker
         try
         {
             var result = await resultTask;
-            return SerializeResponse(new
+            return SerializeResponse(w =>
             {
-                output = result.Output,
-                exitCode = result.ExitCode,
-                cwd = result.Cwd,
-                duration = result.Duration,
-                timedOut = false,
+                w.WriteStringOrNull("output", result.Output);
+                w.WriteNumber("exitCode", result.ExitCode);
+                w.WriteStringOrNull("cwd", result.Cwd);
+                w.WriteStringOrNull("duration", result.Duration);
+                w.WriteBoolean("timedOut", false);
             });
         }
         catch (TimeoutException)
         {
-            return SerializeResponse(new
+            return SerializeResponse(w =>
             {
-                output = "",
-                exitCode = 0,
-                cwd = (string?)null,
-                duration = (timeoutMs / 1000.0).ToString("F1"),
-                timedOut = true,
+                w.WriteString("output", "");
+                w.WriteNumber("exitCode", 0);
+                w.WriteNull("cwd");
+                w.WriteString("duration", (timeoutMs / 1000.0).ToString("F1"));
+                w.WriteBoolean("timedOut", true);
             });
         }
     }
@@ -911,16 +919,16 @@ public class ConsoleWorker
     {
         var cached = _tracker.ConsumeCachedOutput();
         if (cached == null)
-            return SerializeResponse(new { status = "no_cache" });
+            return SerializeResponse(w => w.WriteString("status", "no_cache"));
 
-        return SerializeResponse(new
+        return SerializeResponse(w =>
         {
-            status = "ok",
-            output = cached.Output,
-            exitCode = cached.ExitCode,
-            cwd = cached.Cwd,
-            command = cached.Command,
-            duration = cached.Duration,
+            w.WriteString("status", "ok");
+            w.WriteStringOrNull("output", cached.Output);
+            w.WriteNumber("exitCode", cached.ExitCode);
+            w.WriteStringOrNull("cwd", cached.Cwd);
+            w.WriteStringOrNull("command", cached.Command);
+            w.WriteStringOrNull("duration", cached.Duration);
         });
     }
 
@@ -984,7 +992,7 @@ public class ConsoleWorker
             _stdoutStream.Write(osc, 0, osc.Length);
             _stdoutStream.Flush();
         }
-        return SerializeResponse(new { status = "ok" });
+        return SerializeResponse(w => w.WriteString("status", "ok"));
     }
 
     /// <summary>
@@ -1043,7 +1051,7 @@ public class ConsoleWorker
         }
         catch (Exception ex) { Log($"DisplayBanner kick failed: {ex.Message}"); }
 
-        return SerializeResponse(new { status = "ok" });
+        return SerializeResponse(w => w.WriteString("status", "ok"));
     }
 
     /// <summary>
@@ -1058,7 +1066,7 @@ public class ConsoleWorker
         var proxyVersionStr = request.TryGetProperty("proxy_version", out var vp) ? vp.GetString() : null;
 
         if (proxyPid == 0)
-            return SerializeResponse(new { status = "error", error = "proxy_pid required" });
+            return SerializeResponse(w => { w.WriteString("status", "error"); w.WriteString("error", "proxy_pid required"); });
 
         // Version check: if the calling proxy is strictly newer than this worker,
         // the pipe protocol may have changed in incompatible ways. Refuse the claim,
@@ -1079,10 +1087,10 @@ public class ConsoleWorker
                 isReuse: true);
             Log($"Claim refused: proxy v{proxyVer} > worker v{_myVersion}. Marking obsolete.");
             _claimTcs?.TrySetException(new InvalidOperationException("obsolete"));
-            return SerializeResponse(new
+            return SerializeResponse(w =>
             {
-                status = "obsolete",
-                worker_version = _myVersion.ToString(3)
+                w.WriteString("status", "obsolete");
+                w.WriteString("worker_version", _myVersion.ToString(3));
             });
         }
 
@@ -1092,7 +1100,7 @@ public class ConsoleWorker
         // Signal the main loop to start the new owned pipe
         _claimTcs?.TrySetResult(newPipeName);
 
-        return SerializeResponse(new { status = "ok", pipe = newPipeName });
+        return SerializeResponse(w => { w.WriteString("status", "ok"); w.WriteString("pipe", newPipeName); });
     }
 
     private static int GetProxyPidFromPipeName(string pipeName)
@@ -1111,13 +1119,12 @@ public class ConsoleWorker
         var len = BitConverter.ToInt32(lenBuf);
         var msgBuf = new byte[len];
         await ReadExactAsync(stream, msgBuf, ct);
-        return JsonSerializer.Deserialize<JsonElement>(msgBuf);
+        return PipeJson.ParseElement(msgBuf);
     }
 
     private static async Task WriteMessageAsync(Stream stream, JsonElement message, CancellationToken ct)
     {
-        var json = JsonSerializer.Serialize(message);
-        var msgBytes = Encoding.UTF8.GetBytes(json);
+        var msgBytes = PipeJson.ElementToBytes(message);
         var lenBytes = BitConverter.GetBytes(msgBytes.Length);
         await stream.WriteAsync(lenBytes, ct);
         await stream.WriteAsync(msgBytes, ct);
@@ -1146,8 +1153,8 @@ public class ConsoleWorker
         return sb.ToString();
     }
 
-    private static JsonElement SerializeResponse(object obj)
-        => JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(obj));
+    private static JsonElement SerializeResponse(Action<Utf8JsonWriter> writeFields)
+        => PipeJson.BuildObjectElement(writeFields);
 
     // --- Entry point for --console mode ---
 

@@ -175,11 +175,11 @@ public class ConsoleManager
                     {
                         try
                         {
-                            await SendPipeRequestAsync(reusePipe, new
+                            await SendPipeRequestAsync(reusePipe, w =>
                             {
-                                type = "execute",
-                                command = cdPreamble.TrimEnd('&', ' '), // strip trailing && for standalone cd
-                                timeout = 5000,
+                                w.WriteString("type", "execute");
+                                w.WriteString("command", cdPreamble.TrimEnd('&', ' '));
+                                w.WriteNumber("timeout", 5000);
                             }, TimeSpan.FromSeconds(8));
                             lock (_lock)
                             {
@@ -195,7 +195,7 @@ public class ConsoleManager
                 if (!string.IsNullOrEmpty(banner) || !string.IsNullOrEmpty(reason))
                 {
                     if (reusePipe != null)
-                        try { await SendPipeRequestAsync(reusePipe, new { type = "display_banner", banner, reason }, TimeSpan.FromSeconds(3)); } catch { }
+                        try { await SendPipeRequestAsync(reusePipe, w => { w.WriteString("type", "display_banner"); w.WriteStringOrNull("banner", banner); w.WriteStringOrNull("reason", reason); }, TimeSpan.FromSeconds(3)); } catch { }
                 }
 
                 return new StartConsoleResult("reused", standby.Value.Pid, standby.Value.DisplayName);
@@ -228,7 +228,7 @@ public class ConsoleManager
             }
         }
 
-        try { await SendPipeRequestAsync(pipeName, new { type = "set_title", title = displayName }, TimeSpan.FromSeconds(3)); }
+        try { await SendPipeRequestAsync(pipeName, w => { w.WriteString("type", "set_title"); w.WriteString("title", displayName); }, TimeSpan.FromSeconds(3)); }
         catch { /* best-effort */ }
 
         return new StartConsoleResult("started", pid, displayName);
@@ -287,7 +287,7 @@ public class ConsoleManager
                 try
                 {
                     var statusResp = await SendPipeRequestAsync(sourcePipe,
-                        new { type = "get_status" }, TimeSpan.FromSeconds(3));
+                        w => w.WriteString("type", "get_status"), TimeSpan.FromSeconds(3));
                     sourceCwd = statusResp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
                     var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
                     activeBusy = statusStr == "busy";
@@ -394,12 +394,12 @@ public class ConsoleManager
 
         try
         {
-            var response = await SendPipeRequestAsync(pipeName, new
+            var response = await SendPipeRequestAsync(pipeName, w =>
             {
-                type = "execute",
-                id = Guid.NewGuid().ToString(),
-                command,
-                timeout = timeoutSeconds * 1000,
+                w.WriteString("type", "execute");
+                w.WriteString("id", Guid.NewGuid().ToString());
+                w.WriteString("command", command);
+                w.WriteNumber("timeout", timeoutSeconds * 1000);
             }, TimeSpan.FromSeconds(timeoutSeconds + 5));
 
             // Check if the worker reported a command timeout or busy
@@ -485,15 +485,14 @@ public class ConsoleManager
     public static string GetPipePath(string agentId, int consolePid)
         => GetPipeName(agentId, consolePid);
 
-    private async Task<JsonElement> SendPipeRequestAsync(string pipeName, object message, TimeSpan timeout)
+    private async Task<JsonElement> SendPipeRequestAsync(string pipeName, Action<Utf8JsonWriter> writeBody, TimeSpan timeout)
     {
         using var cts = new CancellationTokenSource(timeout);
         using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
 
         await client.ConnectAsync(cts.Token);
 
-        var json = JsonSerializer.Serialize(message);
-        var msgBytes = Encoding.UTF8.GetBytes(json);
+        var msgBytes = PipeJson.BuildObjectBytes(writeBody);
         var lenBytes = BitConverter.GetBytes(msgBytes.Length);
 
         await client.WriteAsync(lenBytes, cts.Token);
@@ -508,7 +507,7 @@ public class ConsoleManager
         var recvBytes = new byte[recvLen];
         await ReadExactAsync(client, recvBytes, cts.Token);
 
-        return JsonSerializer.Deserialize<JsonElement>(recvBytes);
+        return PipeJson.ParseElement(recvBytes);
     }
 
     /// <summary>
@@ -523,11 +522,11 @@ public class ConsoleManager
 
         try
         {
-            await SendPipeRequestAsync(pipeName, new
+            await SendPipeRequestAsync(pipeName, w =>
             {
-                type = "display_banner",
-                banner,
-                reason
+                w.WriteString("type", "display_banner");
+                w.WriteStringOrNull("banner", banner);
+                w.WriteStringOrNull("reason", reason);
             }, TimeSpan.FromSeconds(3));
         }
         catch { /* best-effort */ }
@@ -558,8 +557,7 @@ public class ConsoleManager
                 await client.ConnectAsync(cts.Token);
 
                 // Send a ping to verify the worker is fully ready
-                var json = JsonSerializer.Serialize(new { type = "ping" });
-                var msgBytes = Encoding.UTF8.GetBytes(json);
+                var msgBytes = PipeJson.BuildObjectBytes(w => w.WriteString("type", "ping"));
                 var lenBytes = BitConverter.GetBytes(msgBytes.Length);
                 await client.WriteAsync(lenBytes);
                 await client.WriteAsync(msgBytes);
@@ -609,7 +607,7 @@ public class ConsoleManager
             try
             {
                 var response = await SendPipeRequestAsync(pipe,
-                    new { type = "get_status" },
+                    w => w.WriteString("type", "get_status"),
                     TimeSpan.FromSeconds(3));
 
                 var status = response.TryGetProperty("status", out var sp) ? sp.GetString() : null;
@@ -665,13 +663,13 @@ public class ConsoleManager
                 var newPipeName = GetPipeName("default", pid.Value);
                 try
                 {
-                    var claimResponse = await SendPipeRequestAsync(pipe, new
+                    var claimResponse = await SendPipeRequestAsync(pipe, w =>
                     {
-                        type = "claim",
-                        proxy_pid = ProxyPid,
-                        proxy_version = ProxyVersion,
-                        agent_id = "default",
-                        title = displayNameNew
+                        w.WriteString("type", "claim");
+                        w.WriteNumber("proxy_pid", ProxyPid);
+                        w.WriteString("proxy_version", ProxyVersion);
+                        w.WriteString("agent_id", "default");
+                        w.WriteString("title", displayNameNew);
                     }, TimeSpan.FromSeconds(3));
 
                     // Worker refused claim because our proxy is strictly newer than it
@@ -735,7 +733,7 @@ public class ConsoleManager
         try
         {
             var resp = await SendPipeRequestAsync(pipeName,
-                new { type = "get_status" },
+                w => w.WriteString("type", "get_status"),
                 TimeSpan.FromSeconds(3));
             return resp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
         }
@@ -783,14 +781,14 @@ public class ConsoleManager
             try
             {
                 var statusResp = await SendPipeRequestAsync(pipe,
-                    new { type = "get_status" },
+                    w => w.WriteString("type", "get_status"),
                     TimeSpan.FromSeconds(3));
 
                 var hasCached = statusResp.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
                 if (!hasCached) continue;
 
                 var cachedResp = await SendPipeRequestAsync(pipe,
-                    new { type = "get_cached_output" },
+                    w => w.WriteString("type", "get_cached_output"),
                     TimeSpan.FromSeconds(5));
 
                 var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
@@ -837,7 +835,7 @@ public class ConsoleManager
                 {
                     // Check status
                     var statusResp = await SendPipeRequestAsync(pipe,
-                        new { type = "get_status" },
+                        w => w.WriteString("type", "get_status"),
                         TimeSpan.FromSeconds(3));
 
                     var hasCached = statusResp.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
@@ -845,7 +843,7 @@ public class ConsoleManager
 
                     // Retrieve cached output
                     var cachedResp = await SendPipeRequestAsync(pipe,
-                        new { type = "get_cached_output" },
+                        w => w.WriteString("type", "get_cached_output"),
                         TimeSpan.FromSeconds(5));
 
                     var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;

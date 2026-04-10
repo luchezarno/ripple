@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
+using SplashShell.Services;
 
 namespace SplashShell.Tests;
 
@@ -60,14 +61,14 @@ public class ConsoleWorkerTests
 
         // Test 1: ping
         {
-            var resp = await SendRequest(pipeName, new { type = "ping" });
+            var resp = await SendRequest(pipeName, w => w.WriteString("type", "ping"));
             var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
             Assert(status == "ok", "Ping returns ok");
         }
 
         // Test 2: get_status (should be standby)
         {
-            var resp = await SendRequest(pipeName, new { type = "get_status" });
+            var resp = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
             var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
             Assert(status == "standby", $"Status is standby (got: {status})");
         }
@@ -76,7 +77,7 @@ public class ConsoleWorkerTests
         {
             var command = OperatingSystem.IsWindows() ? "Write-Output 'hello splashshell'" : "echo 'hello splashshell'";
             Console.WriteLine($"  Executing: {command}");
-            var resp = await SendRequest(pipeName, new { type = "execute", command, timeout = 10000 }, TimeSpan.FromSeconds(15));
+            var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", command); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
 
             var output = resp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
             var timedOut = resp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
@@ -98,7 +99,7 @@ public class ConsoleWorkerTests
                 ? "cmd /c exit 42"
                 : "bash -c 'exit 42'";
             Console.WriteLine($"  Executing: {command}");
-            var resp = await SendRequest(pipeName, new { type = "execute", command, timeout = 10000 }, TimeSpan.FromSeconds(15));
+            var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", command); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
 
             var exitCode = resp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : -1;
             var timedOut = resp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
@@ -110,7 +111,7 @@ public class ConsoleWorkerTests
 
         // Test 5: get_status after commands (should be standby again)
         {
-            var resp = await SendRequest(pipeName, new { type = "get_status" });
+            var resp = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
             var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
             Assert(status == "standby", $"Status back to standby (got: {status})");
         }
@@ -122,13 +123,13 @@ public class ConsoleWorkerTests
         // so the human user can keep working in the terminal.
         {
             var unownedPipe = $"SP.{workerPid}";
-            var resp = await SendRequest(unownedPipe, new
+            var resp = await SendRequest(unownedPipe, w =>
             {
-                type = "claim",
-                proxy_pid = proxyPid,
-                proxy_version = "99.99.99",
-                agent_id = "v2test",
-                title = "#fake high version"
+                w.WriteString("type", "claim");
+                w.WriteNumber("proxy_pid", proxyPid);
+                w.WriteString("proxy_version", "99.99.99");
+                w.WriteString("agent_id", "v2test");
+                w.WriteString("title", "#fake high version");
             });
             var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
             Assert(status == "obsolete", $"Claim with higher proxy_version returns obsolete (got: {status})");
@@ -138,7 +139,7 @@ public class ConsoleWorkerTests
 
             // PTY must still be alive so the user can continue working.
             var execResp = await SendRequest(pipeName,
-                new { type = "execute", command = "Write-Output 'still-alive'", timeout = 10000 },
+                w => { w.WriteString("type", "execute"); w.WriteString("command", "Write-Output 'still-alive'"); w.WriteNumber("timeout", 10000); },
                 TimeSpan.FromSeconds(15));
             var execOutput = execResp.TryGetProperty("output", out var eo) ? eo.GetString() ?? "" : "";
             Assert(execOutput.Contains("still-alive"), $"PTY still alive after obsolete state (output: {execOutput.Replace("\n", "\\n")})");
@@ -164,7 +165,7 @@ public class ConsoleWorkerTests
         {
             try
             {
-                var resp = await SendRequest(pipeName, new { type = "ping" }, TimeSpan.FromSeconds(2));
+                var resp = await SendRequest(pipeName, w => w.WriteString("type", "ping"), TimeSpan.FromSeconds(2));
                 return true;
             }
             catch
@@ -175,7 +176,7 @@ public class ConsoleWorkerTests
         return false;
     }
 
-    private static async Task<JsonElement> SendRequest(string pipeName, object request, TimeSpan? timeout = null)
+    private static async Task<JsonElement> SendRequest(string pipeName, Action<Utf8JsonWriter> writeBody, TimeSpan? timeout = null)
     {
         timeout ??= TimeSpan.FromSeconds(5);
         using var cts = new CancellationTokenSource(timeout.Value);
@@ -183,8 +184,7 @@ public class ConsoleWorkerTests
 
         await client.ConnectAsync(cts.Token);
 
-        var json = JsonSerializer.Serialize(request);
-        var msgBytes = Encoding.UTF8.GetBytes(json);
+        var msgBytes = PipeJson.BuildObjectBytes(writeBody);
         var lenBytes = BitConverter.GetBytes(msgBytes.Length);
 
         await client.WriteAsync(lenBytes, cts.Token);
@@ -198,7 +198,7 @@ public class ConsoleWorkerTests
         var recvBytes = new byte[recvLen];
         await ReadExactAsync(client, recvBytes, cts.Token);
 
-        return JsonSerializer.Deserialize<JsonElement>(recvBytes);
+        return PipeJson.ParseElement(recvBytes);
     }
 
     private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)

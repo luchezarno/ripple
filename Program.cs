@@ -57,7 +57,6 @@ public class Program
 
         var host = builder.Build();
 
-        // Initialize console manager
         var consoleManager = host.Services.GetRequiredService<ConsoleManager>();
         consoleManager.Initialize();
 
