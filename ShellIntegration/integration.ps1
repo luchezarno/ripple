@@ -54,10 +54,14 @@ function global:prompt {
 # Emit initial CommandInputStart marker via Write-Host (goes to console screen buffer)
 Write-Host -NoNewline (__sp_osc_str "B")
 
-# Override Enter to emit OSC B (CommandInputStart) after AcceptLine rendering.
-# AcceptLine() runs first (PSReadLine redraws), then OSC B signals the worker
-# to discard the rendering noise and start capturing clean command output.
+# Override Enter to emit OSC B before AcceptLine. OSC B resets the tracker's
+# output buffer, then AcceptLine's rendering (echo + \r\n) flows in as the
+# first bytes of _output. CleanOutput() strips everything up to the first
+# \r\n, which reliably removes that rendering regardless of how the PTY
+# chunks the bytes. Emitting OSC B after AcceptLine worked for single-chunk
+# reads but stripped the first line of real output when <echo>\r\n and
+# <OSC-B> arrived in separate reads.
 Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
-    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
     Write-Host -NoNewline (__sp_osc_str "B")
+    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
 }
