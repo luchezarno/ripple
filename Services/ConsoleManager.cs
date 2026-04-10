@@ -212,7 +212,9 @@ public class ConsoleManager
                         try { await SendPipeRequestAsync(reusePipe, w => { w.WriteString("type", "display_banner"); w.WriteStringOrNull("banner", banner); w.WriteStringOrNull("reason", reason); }, TimeSpan.FromSeconds(3)); } catch { }
                 }
 
-                return new StartConsoleResult("reused", standby.Value.Pid, standby.Value.DisplayName);
+                string? reusedCwd;
+                lock (_lock) reusedCwd = _consoles.GetValueOrDefault(standby.Value.Pid)?.LastAiCwd;
+                return new StartConsoleResult("reused", standby.Value.Pid, standby.Value.DisplayName, shellFamily, reusedCwd);
             }
         }
 
@@ -245,7 +247,7 @@ public class ConsoleManager
         try { await SendPipeRequestAsync(pipeName, w => { w.WriteString("type", "set_title"); w.WriteString("title", displayName); }, TimeSpan.FromSeconds(3)); }
         catch { /* best-effort */ }
 
-        return new StartConsoleResult("started", pid, displayName);
+        return new StartConsoleResult("started", pid, displayName, shellFamily, initialCwd);
     }
 
     /// <summary>
@@ -1301,7 +1303,7 @@ public class ConsoleManager
         }
     }
 
-    public record StartConsoleResult(string Status, int Pid, string DisplayName);
+    public record StartConsoleResult(string Status, int Pid, string DisplayName, string? ShellFamily = null, string? Cwd = null);
 
     public class ExecuteResult
     {

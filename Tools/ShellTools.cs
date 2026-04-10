@@ -35,9 +35,11 @@ public class ShellTools
         }
 
         var result = await consoleManager.StartConsoleAsync(shell, cwd, reason, agentId, banner);
+        var shellInfo = result.ShellFamily != null ? $" ({result.ShellFamily})" : "";
+        var cwdInfo = !string.IsNullOrEmpty(result.Cwd) ? $" at {result.Cwd}" : "";
         var response = result.Status == "reused"
-            ? $"Reusing standby console {result.DisplayName}. Did not launch a new console. To force a new console, provide the reason parameter."
-            : $"Console {result.DisplayName} opened.";
+            ? $"Reusing standby console {result.DisplayName}{shellInfo}{cwdInfo}. Did not launch a new console. To force a new console, provide the reason parameter."
+            : $"Console {result.DisplayName}{shellInfo} opened{cwdInfo}.";
 
         return await AppendCachedOutputs(consoleManager, agentId, response);
     }
