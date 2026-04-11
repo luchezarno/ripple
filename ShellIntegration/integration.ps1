@@ -95,3 +95,17 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
     $global:__sp_pending_user_command = $true
     [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
 }
+
+# Skip the internal `. 'C:\...\.splash-exec-*.ps1'; Remove-Item ...`
+# dot-source lines that splash uses to run multi-line AI commands. Those
+# are an implementation detail — the user pressing Up to recall history
+# wants to see the real previous commands they typed, not the transient
+# tempfile path, and the scrollback already shows the colorized echo of
+# the actual command body via the tempfile's own output.
+Set-PSReadLineOption -AddToHistoryHandler {
+    param([string]$line)
+    if ($line -match "\.splash-exec-.*\.ps1") {
+        return [Microsoft.PowerShell.AddToHistoryOption]::SkipAdding
+    }
+    return [Microsoft.PowerShell.AddToHistoryOption]::MemoryAndFile
+}

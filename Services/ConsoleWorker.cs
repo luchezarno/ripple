@@ -40,6 +40,21 @@ public class ConsoleWorker
                 }
                 catch { /* in use by another live worker, or locked — skip */ }
             }
+            // Multi-line command tempfiles — HandleExecuteAsync writes the
+            // command body to `.splash-exec-{pid}-{guid}.ps1` and deletes
+            // it inline via `Remove-Item` after dot-sourcing. If the
+            // worker crashes or the shell dies mid-dot-source the delete
+            // never runs, so sweep stale ones older than 24 hours here
+            // on startup just like we do for the logs.
+            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), ".splash-exec-*.ps1"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(path) < cutoff)
+                        File.Delete(path);
+                }
+                catch { /* in use / locked — skip */ }
+            }
         }
         catch { /* TEMP not readable — skip */ }
     }
@@ -1058,9 +1073,107 @@ public class ConsoleWorker
         var echoText = PwshColorizer.Colorize(command);
         var cwd = _tracker.LastKnownCwd ?? _cwd;
         var synthPrompt = $"PS {cwd}> ";
-        var cmdDisplay = Encoding.UTF8.GetBytes($"\r\x1b[2K{synthPrompt}{echoText}");
+
+        // Multi-line commands read much better when the body starts on its
+        // own line instead of being glued to the prompt. Insert a newline
+        // right after the prompt when the command contains an embedded
+        // newline. Strip any trailing newline from echoText so the last
+        // line of the echo sits on its own line without an extra blank
+        // row before PSReadLine's AcceptLine finalizes.
+        string payload;
+        if (command.Contains('\n'))
+        {
+            var trimmed = echoText.TrimEnd('\n', '\r');
+            payload = $"\r\x1b[2K{synthPrompt}\r\n{trimmed}";
+        }
+        else
+        {
+            payload = $"\r\x1b[2K{synthPrompt}{echoText}";
+        }
+
+        var cmdDisplay = Encoding.UTF8.GetBytes(payload);
         _stdoutStream.Write(cmdDisplay, 0, cmdDisplay.Length);
         _stdoutStream.Flush();
+    }
+
+    /// <summary>
+    /// Build the body of a tempfile that runs a multi-line AI command. The
+    /// wrapper does three things in order:
+    ///   1. Move the cursor up one row and clear the line. PSReadLine
+    ///      displays `. 'path/to/tempfile.ps1'` as the "command being run"
+    ///      on the previous prompt row when the user presses Enter; we
+    ///      overwrite that line with a synthesized prompt + the real AI
+    ///      command text so the visible console ends up looking like the
+    ///      user just typed the multi-line command at a fresh prompt.
+    ///   2. Write the colorized echo (PS prompt + newline + colorized
+    ///      multi-line body) via a single [Console]::Write call. The
+    ///      payload is base64-encoded so the raw ESC sequences inside the
+    ///      colorizer output don't have to be escaped for a PowerShell
+    ///      string literal. Crucially, this is emitted by the child shell
+    ///      itself — NOT by the worker writing to _stdoutStream — so the
+    ///      child's virtual buffer (and therefore PSReadLine's _initialY
+    ///      for future input loops) stays in sync with the rows the
+    ///      visible console actually shows. Rendering the echo from the
+    ///      worker side bypassed ConPTY and left PSReadLine's history
+    ///      display N rows above where the user expected it.
+    ///   3. Emit an OSC 633;C marker. The PreCommandLookupAction that
+    ///      fires OSC C naturally was already triggered at the first
+    ///      real cmdlet invocation, but its _commandStart was captured
+    ///      BEFORE the echo was written. We re-emit OSC C right after
+    ///      the echo so _commandStart gets reset to the end of the echo,
+    ///      and the captured output window the AI sees excludes the
+    ///      echo lines.
+    /// Finally the AI's actual multi-line command body follows.
+    /// </summary>
+    private string BuildMultiLineTempfileBody(string command, int wrapRowCount)
+    {
+        var colorizedBody = PwshColorizer.Colorize(command).TrimEnd('\r', '\n');
+        var cwd = _tracker.LastKnownCwd ?? _cwd;
+        var synthPrompt = $"PS {cwd}> ";
+
+        // Build the full payload as a single blob:
+        //   \e[<N>F          — cursor previous line (CPL) — move up N
+        //                      rows to col 0 of the start of the
+        //                      dot-source input. N is sized by the
+        //                      caller based on terminal width so we
+        //                      cover the entire wrapped input area,
+        //                      not just the last row.
+        //   \e[0J            — erase display from the cursor to end
+        //                      (wipes the dot-source input + any
+        //                      trailing rows, leaves scrollback above
+        //                      the prompt untouched).
+        //   PS cwd> \r\n     — synthetic prompt + newline so the
+        //                      command body reads as a clean block
+        //                      below it.
+        //   <colorized body> — the AI command, ANSI-colored.
+        //   \r\n             — terminator.
+        //   \e]633;C\a       — manual OSC C so CommandTracker rewinds
+        //                      _commandStart past the echo and the AI
+        //                      doesn't see this noise in its captured
+        //                      output.
+        // Pack it base64 and decode at runtime. Decoded bytes go straight
+        // through OpenStandardOutput, bypassing pwsh's host TextWriter
+        // layer (which was transforming our cursor-control escapes).
+        var payload = new StringBuilder();
+        payload.Append('\x1b').Append($"[{Math.Max(1, wrapRowCount)}F"); // CPL N
+        payload.Append('\x1b').Append("[0J");                            // ED 0
+        payload.Append(synthPrompt);
+        payload.Append("\r\n");
+        payload.Append(colorizedBody);
+        payload.Append("\r\n");
+        payload.Append('\x1b').Append("]633;C").Append('\x07');          // OSC C
+        var payloadBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(payload.ToString()));
+
+        var sb = new StringBuilder();
+        // Bypass pwsh's host Console wrapper by grabbing the raw stdout
+        // stream and writing the payload as bytes directly.
+        sb.AppendLine("$__sp_out = [System.Console]::OpenStandardOutput()");
+        sb.AppendLine($"$__sp_bytes = [System.Convert]::FromBase64String('{payloadBase64}')");
+        sb.AppendLine("$__sp_out.Write($__sp_bytes, 0, $__sp_bytes.Length)");
+        sb.AppendLine("$__sp_out.Flush()");
+        // and finally the real command body, normalized to LF line endings
+        sb.AppendLine(command.Replace("\r\n", "\n"));
+        return sb.ToString();
     }
 
     private async Task<JsonElement> HandleExecuteAsync(JsonElement request, CancellationToken ct)
@@ -1077,7 +1190,13 @@ public class ConsoleWorker
         var shellName = ConsoleManager.NormalizeShellFamily(_shell);
         var enter = ConsoleManager.EnterKeyFor(shellName);
 
-        if (ConsoleManager.IsPowerShellFamily(shellName))
+        // Multi-line pwsh commands have their echo emitted from inside the
+        // tempfile itself via [Console]::Write so the child's virtual
+        // buffer's cursor tracking stays consistent with what the visible
+        // console shows — see BuildMultiLineTempfileBody. Only render the
+        // echo directly here for single-line commands.
+        bool isMultiLinePwsh = ConsoleManager.IsPowerShellFamily(shellName) && command.Contains('\n');
+        if (ConsoleManager.IsPowerShellFamily(shellName) && !isMultiLinePwsh)
             RenderPwshCommandEcho(command);
 
         // Register command with tracker (it will resolve when OSC PromptStart arrives).
@@ -1096,7 +1215,46 @@ public class ConsoleWorker
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
         }
 
-        await WriteToPty(command + enter, ct);
+        // Multi-line commands can't be written straight to the PTY: pwsh
+        // (and bash) would treat each embedded \n as "submit line now",
+        // push subsequent lines into the continuation-prompt input, and
+        // fragment the OSC markers so the capture window is meaningless.
+        // Bracketed paste and raw passthrough both proved unreliable
+        // under ConPTY, so we fall back to the robust approach: write
+        // the full multi-line body to a temp file and dot-source it.
+        // The shell parses the file as-is — heredocs, comments, nested
+        // scriptblocks and multi-line pipelines all survive — and the
+        // `. 'file'` form runs in the caller's scope so variables and
+        // functions defined by the command persist for later calls.
+        // Single-line commands skip the temp file and go straight to the
+        // PTY as before so echo / history quality stays highest for the
+        // common case.
+        string ptyPayload;
+        if (isMultiLinePwsh)
+        {
+            var tmpFile = Path.Combine(Path.GetTempPath(), $".splash-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.ps1");
+            var ptyInput = $". '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue";
+
+            // Work out how many terminal rows the dot-source + Remove-Item
+            // input occupies once it wraps at the PTY's current width, so
+            // BuildMultiLineTempfileBody can emit `\e[<N>F\e[0J` and wipe
+            // every wrapped row rather than just the last one. Prompt is
+            // "PS <cwd>> " followed by the ptyInput itself.
+            int termWidth = 120;
+            try { if (Console.WindowWidth > 0) termWidth = Console.WindowWidth; } catch { }
+            var cwdForPrompt = _tracker.LastKnownCwd ?? _cwd ?? "";
+            var promptLen = 3 /* "PS " */ + cwdForPrompt.Length + 2 /* "> " */;
+            var totalCols = promptLen + ptyInput.Length;
+            var wrapRowCount = Math.Max(1, (totalCols + termWidth - 1) / termWidth);
+
+            await File.WriteAllTextAsync(tmpFile, BuildMultiLineTempfileBody(command, wrapRowCount), ct);
+            ptyPayload = ptyInput + enter;
+        }
+        else
+        {
+            ptyPayload = command + enter;
+        }
+        await WriteToPty(ptyPayload, ct);
 
         try
         {
