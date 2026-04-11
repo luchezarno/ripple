@@ -99,16 +99,22 @@ public class ConsoleWorker
         Console.OutputEncoding = Encoding.UTF8;
 
         // Set initial window title (unowned format — proxy will update after claiming)
-        Console.Title = $"#{Environment.ProcessId} ____";
+        Console.Title = $"#{Environment.ProcessId} ~~~~";
 
         // Enable Virtual Terminal Processing on stdout so the visible console
         // interprets ANSI/VT escape sequences (cursor movement, clear-to-EOL,
         // colors) emitted by the shell instead of writing them as literal chars.
         EnableVirtualTerminalOutput();
 
-        // Display banner/reason immediately, before the shell starts.
-        // This ensures the banner is the first thing visible in the console.
-        WriteBanner();
+        // Display banner/reason. For pwsh/powershell, banner emission is
+        // delegated to the generated integration tempfile so it survives
+        // ConPTY's startup `\e[2J\e[H` wipe; see BuildCommandLine. For
+        // other shells, write directly to the worker's stdout here. (TODO:
+        // bash/zsh/cmd have the same ConPTY-wipe issue and would also
+        // benefit from shell-side emission.)
+        var bannerShellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        if (bannerShellName is not "pwsh" and not "powershell")
+            WriteBanner();
 
         // Prepare shell integration script BEFORE launching the shell.
         // For pwsh, we pass it via -NoExit -Command so it doesn't echo in the console.
@@ -206,7 +212,7 @@ public class ConsoleWorker
 
             // Wait for re-claim via unowned pipe (blocks until _claimTcs is set)
             _claimTcs = new TaskCompletionSource<string>();
-            Console.Title = $"#{Environment.ProcessId} ____";
+            Console.Title = $"#{Environment.ProcessId} ~~~~";
             Log("Proxy died, waiting for re-claim on unowned pipe...");
 
             string newPipeName;
@@ -277,8 +283,23 @@ public class ConsoleWorker
             var script = LoadEmbeddedScript("integration.ps1");
             if (script != null)
             {
+                // Prepend Write-Host banner/reason lines so they're emitted by
+                // pwsh itself AFTER ConPTY's initial `\e[?9001h...\e[2J\e[H`
+                // screen-clear payload. If we wrote them to the worker's
+                // stdout before the PTY started (the old WriteBanner path),
+                // ConPTY wipes them almost immediately, which the user saw
+                // as banner text flashing on screen for ~0.5s.
+                var prefix = new StringBuilder();
+                if (!string.IsNullOrEmpty(_banner))
+                    prefix.AppendLine($"Write-Host '{_banner.Replace("'", "''")}' -ForegroundColor Green");
+                if (!string.IsNullOrEmpty(_banner) && !string.IsNullOrEmpty(_reason))
+                    prefix.AppendLine("Write-Host");
+                if (!string.IsNullOrEmpty(_reason))
+                    prefix.AppendLine($"Write-Host 'Reason: {_reason.Replace("'", "''")}' -ForegroundColor DarkYellow");
+                if (prefix.Length > 0) prefix.AppendLine("Write-Host");
+
                 var tmpFile = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1");
-                File.WriteAllText(tmpFile, script);
+                File.WriteAllText(tmpFile, prefix.ToString() + script);
                 // -NoExit keeps the shell alive after -Command completes.
                 // The command imports PSReadLine + sources the integration script silently.
                 var cmd = $"Import-Module PSReadLine -ErrorAction SilentlyContinue; . '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue";

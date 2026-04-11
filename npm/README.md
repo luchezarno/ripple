@@ -97,7 +97,7 @@ splashshell tracks the cwd of every console and can switch transparently between
 | Switch to a different shell | Warns to confirm cwd (cross-shell path translation is not implemented) |
 | User manually `cd`'d in the active console | Warns so the AI can verify the new cwd before running its next command |
 
-Window titles use the format `#PID Name` (e.g., `#12345 Sapphire`) so you can identify each console at a glance. When the parent MCP process exits, titles change to `#PID ____` to indicate the console is up for re-claim.
+Window titles use the format `#PID Name` (e.g., `#12345 Sapphire`) so you can identify each console at a glance. When the parent MCP process exits, titles change to `#PID ~~~~` to indicate the console is up for re-claim.
 
 ## Platform support
 
