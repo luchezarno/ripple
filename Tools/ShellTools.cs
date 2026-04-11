@@ -9,7 +9,7 @@ namespace SplashShell.Tools;
 public class ShellTools
 {
     [McpServerTool]
-    [Description("Open a visible terminal window. The user can see and type in this terminal. AI commands sent via execute_command will also appear here. If a standby console of the requested shell exists, it will be reused unless reason is provided. Multiple shell types can be active simultaneously.")]
+    [Description("Open a visible terminal window. The user can see and type in this terminal; AI commands sent via execute_command will also appear here in real time. If a standby console of the requested shell already exists it is reused unless `reason` is provided. Multiple shell types can be active simultaneously. Every response also reports the busy / finished / closed state of any other consoles you have open so background work stays visible.")]
     public static async Task<string> StartConsole(
         ConsoleManager consoleManager,
         [Description("Shell to use. Name (bash, pwsh, zsh, cmd) or full path. Default: platform default.")]
@@ -45,7 +45,7 @@ public class ShellTools
     }
 
     [McpServerTool]
-    [Description("Execute a command in the shared terminal. The command and its output are visible to the user in real time. Session state persists across calls. Call start_console first if no console is open. Optionally specify shell to target a specific shell type.")]
+    [Description("Execute a command in the shared terminal. The command and its output are visible to the user as they stream. Session state (variables, modules, cwd) persists across calls. If the active console is busy with a user-typed command, splash auto-routes to a same-family standby (or auto-starts a fresh one) and preserves your last known cwd via a cd preamble — if the source console was moved by the user since your last command, you'll see a one-line routing notice explaining what splash did. If the active console is idle but the user manually cd'd in it since your last command, the call returns a verify-and-retry warning instead of running. Every response also reports any other consoles' busy / finished / closed state so you stay aware of background activity.")]
     public static async Task<string> ExecuteCommand(
         ConsoleManager consoleManager,
         [Description("The pipeline to execute (supports pipes, e.g. 'ls | grep foo')")]
@@ -86,7 +86,7 @@ public class ShellTools
     }
 
     [McpServerTool]
-    [Description("Wait for busy console(s) to complete and retrieve cached output. Use this after a command times out.")]
+    [Description("Wait for AI-initiated commands that previously timed out to finish and retrieve their cached output. Returns one of three states: 'no commands pending' (nothing to wait for, stop calling), 'completed' (one or more drained results included in the response), or 'still busy' (call again to keep waiting). Use this after execute_command returned a Busy/timed-out result.")]
     public static async Task<string> WaitForCompletion(
         ConsoleManager consoleManager,
         [Description("Maximum seconds to wait (default: 30)")]
