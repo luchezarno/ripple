@@ -119,8 +119,7 @@ public class ConsoleWorker
         // other shells, write directly to the worker's stdout here. (TODO:
         // bash/zsh/cmd have the same ConPTY-wipe issue and would also
         // benefit from shell-side emission.)
-        var bannerShellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
-        if (bannerShellName is not "pwsh" and not "powershell")
+        if (!ConsoleManager.IsPowerShellFamily(ConsoleManager.NormalizeShellFamily(_shell)))
             WriteBanner();
 
         // Prepare shell integration script BEFORE launching the shell.
@@ -131,8 +130,8 @@ public class ConsoleWorker
         // Use the visible console's actual dimensions instead of hardcoded 120x30.
         // MSYS2/Git Bash needs the parent's environment (MSYSTEM, HOME, PATH with Git paths).
         // pwsh uses a clean environment to avoid inheriting MCP server variables.
-        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
-        bool inheritEnv = shellName is not "pwsh" and not "powershell";
+        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
+        bool inheritEnv = !ConsoleManager.IsPowerShellFamily(shellName);
         int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         _pty = PtyFactory.Start(commandLine, _cwd, cols, rows, inheritEnvironment: inheritEnv);
@@ -149,10 +148,9 @@ public class ConsoleWorker
         // loop via _shellExitedTcs so the worker can tear itself down.
         _ = WaitForShellExitAsync(ct);
 
-        // Shell-specific Enter key: Unix shells use \n, Windows shells use \r
-        var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
+        var enter = ConsoleManager.EnterKeyFor(shellName);
 
-        if (shellName is "pwsh" or "powershell")
+        if (ConsoleManager.IsPowerShellFamily(shellName))
         {
             // pwsh with -NoExit -Command sources the integration script during
             // startup, then drops into interactive mode where the overridden
@@ -188,7 +186,7 @@ public class ConsoleWorker
 
         // For shells with PTY-injected integration (bash/zsh), the prompt drawn
         // during injection was suppressed. Send a kick to draw a fresh prompt.
-        if (shellName is not "pwsh" and not "powershell" and not "cmd")
+        if (!ConsoleManager.IsPowerShellFamily(shellName) && shellName is not "cmd")
         {
             await WriteToPty(enter, ct);
         }
@@ -308,9 +306,9 @@ public class ConsoleWorker
     /// </summary>
     private string BuildCommandLine()
     {
-        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
 
-        if (shellName is "pwsh" or "powershell")
+        if (ConsoleManager.IsPowerShellFamily(shellName))
         {
             var script = LoadEmbeddedScript("integration.ps1");
             if (script != null)
@@ -387,7 +385,7 @@ public class ConsoleWorker
 
     private async Task InjectShellIntegration(CancellationToken ct)
     {
-        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
         string? script = shellName switch
         {
             "bash" or "sh" => LoadEmbeddedScript("integration.bash"),
@@ -404,14 +402,12 @@ public class ConsoleWorker
 
         // Inject script via PTY — write it as a temporary file, source it, then delete
         // This avoids quoting issues with multi-line heredocs in different shells
-        var tmpFile = shellName switch
-        {
-            "pwsh" or "powershell" => Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1"),
-            _ => $"/tmp/.splashshell-integration-{Environment.ProcessId}.sh",
-        };
+        var tmpFile = ConsoleManager.IsPowerShellFamily(shellName)
+            ? Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1")
+            : $"/tmp/.splashshell-integration-{Environment.ProcessId}.sh";
 
         // For Windows paths, use pwsh-compatible approach
-        if (OperatingSystem.IsWindows() && shellName is "pwsh" or "powershell")
+        if (OperatingSystem.IsWindows() && ConsoleManager.IsPowerShellFamily(shellName))
         {
             tmpFile = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1");
             // Write file directly from worker process (we share filesystem with shell)
@@ -612,9 +608,9 @@ public class ConsoleWorker
                 //   - No ENABLE_PROCESSED_INPUT: Ctrl+C → \x03 (not signal)
                 SetConsoleMode(hStdIn, ENABLE_VIRTUAL_TERMINAL_INPUT);
 
-                var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+                var shellName = ConsoleManager.NormalizeShellFamily(_shell);
                 // pwsh and cmd.exe understand win32-input-mode natively; only Unix shells need translation
-                bool needsTranslation = shellName is not "pwsh" and not "powershell" and not "cmd";
+                bool needsTranslation = !ConsoleManager.IsPowerShellFamily(shellName) && shellName is not "cmd";
 
                 var charBuf = new char[256];
                 var pending = needsTranslation ? new StringBuilder() : null;
@@ -996,7 +992,7 @@ public class ConsoleWorker
             {
                 w.WriteString("status", Status);
                 w.WriteBoolean("hasCachedOutput", _tracker.HasCachedOutput);
-                w.WriteString("shellFamily", Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant());
+                w.WriteString("shellFamily", ConsoleManager.NormalizeShellFamily(_shell));
                 w.WriteString("shellPath", _shell);
                 w.WriteStringOrNull("cwd", _tracker.LastKnownCwd);
                 w.WriteStringOrNull("runningCommand", _tracker.RunningCommand);
@@ -1030,8 +1026,7 @@ public class ConsoleWorker
     /// </summary>
     private async Task<JsonElement> HandleDrainPostOutputAsync(JsonElement request, CancellationToken ct)
     {
-        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
-        if (shellName is "pwsh" or "powershell")
+        if (ConsoleManager.IsPowerShellFamily(ConsoleManager.NormalizeShellFamily(_shell)))
         {
             _tracker.ClearPostPrimary();
             return SerializeResponse(w => w.WriteNull("delta"));
@@ -1080,12 +1075,10 @@ public class ConsoleWorker
         if (_tracker.Busy)
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
 
-        // Write command to PTY
-        // Shell-specific Enter: pwsh → \r, bash/zsh → \n
-        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
-        var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
+        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
+        var enter = ConsoleManager.EnterKeyFor(shellName);
 
-        if (shellName is "pwsh" or "powershell")
+        if (ConsoleManager.IsPowerShellFamily(shellName))
             RenderPwshCommandEcho(command);
 
         // Register command with tracker (it will resolve when OSC PromptStart arrives).
@@ -1273,8 +1266,7 @@ public class ConsoleWorker
         WriteBannerText(banner, reason);
 
         // Kick the shell to draw a fresh prompt after the banner
-        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
-        var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
+        var enter = ConsoleManager.EnterKeyFor(ConsoleManager.NormalizeShellFamily(_shell));
         try
         {
             var bytes = Encoding.UTF8.GetBytes(enter);
