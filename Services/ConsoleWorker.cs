@@ -743,6 +743,27 @@ public class ConsoleWorker
 
     // --- PTY output reading ---
 
+    /// <summary>
+    /// Forward a slice of OSC-stripped PTY output to the worker's visible
+    /// console so the human user sees what the AI is doing. Rewrites any
+    /// OSC 0 (set window title) sequences on the way so the title stays as
+    /// splash's "#PID Name" tag instead of being overwritten by whatever
+    /// the shell's prompt decided to set.
+    /// </summary>
+    private void MirrorToVisible(string text)
+    {
+        if (!_mirrorVisible || text.Length == 0) return;
+        try
+        {
+            var cleanedOutput = ReplaceOscTitle(text, _desiredTitle);
+            var outBytes = Encoding.UTF8.GetBytes(cleanedOutput);
+            _stdoutStream ??= Console.OpenStandardOutput();
+            _stdoutStream.Write(outBytes, 0, outBytes.Length);
+            _stdoutStream.Flush();
+        }
+        catch { }
+    }
+
     private Task ReadOutputLoop(CancellationToken ct)
     {
         // Dedicated thread with synchronous ReadFile in a tight loop.
@@ -764,66 +785,42 @@ public class ConsoleWorker
                     if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);
 
-                    // First pass: dispatch every event EXCEPT PromptStart.
-                    // CommandInputStart/CommandExecuted/CommandFinished/Cwd only
-                    // mutate tracker state; they must run before FeedOutput so
-                    // that e.g. OSC B's _output="" happens before the chunk's
-                    // text is appended.
-                    bool sawPromptStart = false;
+                    // Interleave FeedOutput and HandleEvent in source order
+                    // using each event's TextOffset (position in Cleaned where
+                    // the event fired in the original byte stream). This is
+                    // how the tracker knows "_output was N bytes long when
+                    // OSC C arrived", so it can slice out just the region
+                    // between OSC C and OSC D when producing the command
+                    // result — no first-\r\n stripping or AcceptLine heuristics.
+                    int lastOffset = 0;
                     foreach (var evt in result.Events)
                     {
-                        if (evt.Type == OscParser.OscEventType.PromptStart)
+                        if (evt.TextOffset > lastOffset)
                         {
-                            sawPromptStart = true;
-                            if (!_ready)
-                            {
-                                _ready = true;
-                                _readyEvent.Set();
-                            }
-                            continue;
+                            var slice = result.Cleaned.Substring(lastOffset, evt.TextOffset - lastOffset);
+                            _tracker.FeedOutput(slice);
+                            _outputLength += slice.Length;
+                            MirrorToVisible(slice);
+                        }
+                        lastOffset = evt.TextOffset;
+
+                        if (!_ready && evt.Type == OscParser.OscEventType.PromptStart)
+                        {
+                            _ready = true;
+                            _readyEvent.Set();
                         }
                         _tracker.HandleEvent(evt);
                         if (_ready && evt.Type == OscParser.OscEventType.CommandInputStart)
                             _mirrorVisible = true;
                     }
 
-                    if (result.Cleaned.Length > 0)
+                    // Any text after the last event in this chunk.
+                    if (lastOffset < result.Cleaned.Length)
                     {
-                        _tracker.FeedOutput(result.Cleaned);
-                        _outputLength += result.Cleaned.Length;
-
-                        // Mirror PTY output (with OSC stripped) to the worker's
-                        // visible console so the user can see what AI is doing.
-                        // Skip mirroring during shell integration injection to hide the source echo.
-                        if (_mirrorVisible)
-                        {
-                            try
-                            {
-                                // Replace any OSC 0 (set window title) sequences emitted by
-                                // the shell with our desired title, so the title stays as
-                                // "#PID Name" instead of being overridden by e.g. bash's
-                                // "user@host: cwd" prompt title.
-                                var cleanedOutput = ReplaceOscTitle(result.Cleaned, _desiredTitle);
-
-                                // Write directly to stdout as raw UTF-8 bytes — bypasses
-                                // any TextWriter buffering and preserves the exact byte
-                                // sequence (including \b, \e[K) for atomic console processing.
-                                var outBytes = Encoding.UTF8.GetBytes(cleanedOutput);
-                                _stdoutStream ??= Console.OpenStandardOutput();
-                                _stdoutStream.Write(outBytes, 0, outBytes.Length);
-                                _stdoutStream.Flush();
-                            }
-                            catch { }
-                        }
-                    }
-
-                    // Second pass: PromptStart fires Resolve, and Resolve
-                    // needs the chunk's text already in _output. Deferring
-                    // to here prevents the "OSC A handled before feed →
-                    // Cleanup wipes _output → command output lost" race.
-                    if (sawPromptStart)
-                    {
-                        _tracker.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.PromptStart));
+                        var tail = result.Cleaned.Substring(lastOffset);
+                        _tracker.FeedOutput(tail);
+                        _outputLength += tail.Length;
+                        MirrorToVisible(tail);
                     }
                 }
             }
@@ -984,10 +981,32 @@ public class ConsoleWorker
         {
             _mirrorVisible = false;
             _stdoutStream ??= Console.OpenStandardOutput();
-            var cmdDisplay = Encoding.UTF8.GetBytes(command + "\r\n");
+
+            // pwsh 7+ ships a modern PSReadLine with vivid syntax highlighting
+            // in the interactive prompt, so colorize the echo to match what
+            // the human user would see if they'd typed the command. Windows
+            // PowerShell 5.1 (powershell.exe) bundles an older PSReadLine
+            // that doesn't color command input by default — keep that echo
+            // plain so splash's fake echo matches the shell's native style.
+            var echoText = shellName == "pwsh"
+                ? PwshColorizer.Colorize(command)
+                : command;
+
+            // Wipe the current line first and re-emit a synthetic prompt
+            // before our echo. Between commands pwsh is idle in the
+            // PSReadLine input loop, which writes prediction ghost text and
+            // moves the cursor around while rendering. Without the clear,
+            // our echo would land at whatever column PSReadLine left the
+            // cursor at and the previous line would end up with our text
+            // overlaid on the prompt — the "command overwrites the prompt"
+            // glitch. \r moves to column 0, \e[2K clears the entire line,
+            // then we re-emit a default-format prompt and the colorized
+            // command on a clean slate.
+            var cwd = _tracker.LastKnownCwd ?? _cwd;
+            var synthPrompt = $"PS {cwd}> ";
+            var cmdDisplay = Encoding.UTF8.GetBytes($"\r\x1b[2K{synthPrompt}{echoText}\r\n");
             _stdoutStream.Write(cmdDisplay, 0, cmdDisplay.Length);
             _stdoutStream.Flush();
-            _tracker.SuppressUntilCommandStart();
         }
 
         // Register command with tracker (it will resolve when OSC PromptStart arrives).

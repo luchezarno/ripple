@@ -2,9 +2,16 @@
 # Injects OSC 633 escape sequences for command lifecycle tracking.
 # Uses [char] escapes for compatibility with Windows PowerShell 5.1.
 #
-# OSC sequences are embedded in the prompt return string so they flow
-# through the ConPTY console screen buffer (not Console.Out which is
-# a separate stream in ConPTY environments).
+# Event sequence (for both AI-initiated and user-typed commands):
+#   OSC B (Enter pressed) → PSReadLine AcceptLine finalize →
+#   OSC C (command about to execute) → command output →
+#   OSC D;{exitCode} (command finished) → OSC P;Cwd=... → OSC A (prompt ready) →
+#   prompt text rendered → PSReadLine input loop (prediction, etc.)
+#
+# splash captures just the region between OSC C and OSC D as the command
+# output. Bytes outside that window (typing animation, AcceptLine finalize,
+# prompt repaint, PSReadLine prediction) are ignored, so no heuristic
+# "strip up to first newline" logic is needed.
 
 if ($global:__SplashShellInjected) { return }
 $global:__SplashShellInjected = $true
@@ -16,7 +23,11 @@ function global:__sp_osc_str([string]$code) {
     return "$($global:__sp_ESC)]633;$code$($global:__sp_BEL)"
 }
 
-# Override prompt function
+# Override prompt function — emits OSC D (command finished with exit code),
+# OSC P (cwd), OSC A (prompt ready) so splash can detect the end of the
+# command's output and drain its capture window. OSC C is NOT emitted here;
+# it now lives on PreCommandLookupAction below so the "execution started"
+# marker fires BEFORE the command writes anything to the console.
 $global:__sp_original_prompt = $function:prompt
 $global:__sp_last_history_id = 0
 
@@ -28,8 +39,9 @@ function global:prompt {
     if ($lastCmd -and $lastCmd.Id -ne $global:__sp_last_history_id) {
         $global:__sp_last_history_id = $lastCmd.Id
 
-        # CommandExecuted (C) + CommandFinished (D) with exit code
-        $prefix += (__sp_osc_str "C")
+        # CommandFinished with exit code. OSC C is emitted from
+        # PreCommandLookupAction before the command runs, so by the time
+        # we're in the prompt function it has already fired.
         $ec = if ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 0 }
         $prefix += (__sp_osc_str "D;$ec")
     }
@@ -51,17 +63,35 @@ function global:prompt {
     return $prefix + $originalOutput
 }
 
-# Emit initial CommandInputStart marker via Write-Host (goes to console screen buffer)
+# PreCommandLookupAction fires inside the PowerShell engine right before it
+# resolves a command name to an invocation target — i.e. AFTER PSReadLine
+# AcceptLine has finalized the input line and BEFORE the command produces
+# any output. Emit OSC C here so splash knows that whatever follows is real
+# command output, not PSReadLine rendering. The action fires once per
+# command lookup, including nested lookups inside a pipeline, so a flag set
+# by the Enter key handler ensures we emit exactly once per user command.
+$global:__sp_pending_user_command = $false
+
+$ExecutionContext.InvokeCommand.PreCommandLookupAction = {
+    param($commandName, $eventArgs)
+    if ($global:__sp_pending_user_command) {
+        $global:__sp_pending_user_command = $false
+        [Console]::Write((__sp_osc_str "C"))
+    }
+}
+
+# Emit initial CommandInputStart marker via Write-Host (goes to console screen
+# buffer). splash uses this to mark the shell as "ready" (first PromptStart
+# hasn't fired yet at integration-load time, but the subsequent prompt render
+# will).
 Write-Host -NoNewline (__sp_osc_str "B")
 
-# Override Enter to emit OSC B before AcceptLine. OSC B resets the tracker's
-# output buffer, then AcceptLine's rendering (echo + \r\n) flows in as the
-# first bytes of _output. CleanOutput() strips everything up to the first
-# \r\n, which reliably removes that rendering regardless of how the PTY
-# chunks the bytes. Emitting OSC B after AcceptLine worked for single-chunk
-# reads but stripped the first line of real output when <echo>\r\n and
-# <OSC-B> arrived in separate reads.
+# Override Enter to emit OSC B and arm the "next command lookup is a user
+# command" flag. The actual OSC C fires from PreCommandLookupAction a moment
+# later, right before the command runs — by then PSReadLine's AcceptLine has
+# finalized the visible line and we're out of the input-rendering noise.
 Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
     Write-Host -NoNewline (__sp_osc_str "B")
+    $global:__sp_pending_user_command = $true
     [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
 }

@@ -49,9 +49,15 @@ public class CommandTracker
     private int _exitCode;
     private string? _cwd;
     private string _commandSent = "";
-    private bool _captureEnabled = true;
-    private bool _stripAcceptLineNoise = false; // true for pwsh: strip AcceptLine rendering before first \r\n
     private Stopwatch? _stopwatch;
+
+    // Slice markers: _output position at OSC C (command about to run) and
+    // OSC D (command finished). CleanOutput slices [commandStart..commandEnd)
+    // from _output to produce the result, which cleanly excludes both the
+    // AcceptLine finalize rendering that PSReadLine writes between OSC B and
+    // OSC C and the prompt text that comes after OSC D / OSC A.
+    private int _commandStart = -1;
+    private int _commandEnd = -1;
 
     // Trailing output that arrives AFTER Resolve() has returned the primary
     // CommandResult — e.g. the pwsh prompt repaint or pwsh Format-Table rows
@@ -110,6 +116,8 @@ public class CommandTracker
             _exitCode = 0;
             _cwd = null;
             _commandSent = commandText;
+            _commandStart = -1;
+            _commandEnd = -1;
             _cachedResult = null;
             _postPrimaryOutput.Clear();
             _stopwatch = Stopwatch.StartNew();
@@ -134,25 +142,10 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Suppress output capture until CommandInputStart (OSC B) arrives.
-    /// Called for pwsh to discard PSReadLine prediction rendering noise.
-    /// Safety timer re-enables capture after 2s if OSC B never arrives.
-    /// </summary>
-    public void SuppressUntilCommandStart()
-    {
-        lock (_lock)
-        {
-            _captureEnabled = false;
-            _stripAcceptLineNoise = true;
-            _ = Task.Delay(2000).ContinueWith(_ =>
-            {
-                lock (_lock) { if (!_captureEnabled) _captureEnabled = true; }
-            });
-        }
-    }
-
-    /// <summary>
-    /// Feed an OSC event from the parser.
+    /// Feed an OSC event from the parser. The caller must pass events in
+    /// source order, interleaved with matching FeedOutput calls, so that
+    /// _output.Length at event-dispatch time is the offset at which the
+    /// event fired in the original byte stream.
     /// </summary>
     public void HandleEvent(OscParser.OscEvent evt)
     {
@@ -196,13 +189,20 @@ public class CommandTracker
 
             switch (evt.Type)
             {
-                case OscParser.OscEventType.CommandInputStart:
-                    _captureEnabled = true;
-                    _output = "";  // discard PSReadLine prediction noise before OSC B
+                case OscParser.OscEventType.CommandExecuted:
+                    // OSC C: PreCommandLookupAction has fired, everything
+                    // preceding this point in _output is AcceptLine finalize
+                    // noise. Record the position so CleanOutput knows where
+                    // the real command output begins.
+                    _commandStart = _output.Length;
                     break;
 
                 case OscParser.OscEventType.CommandFinished:
+                    // OSC D: command is done, the prompt function is about to
+                    // print the prompt. Snapshot the position here so the
+                    // prompt text is excluded from the result.
                     _exitCode = evt.ExitCode;
+                    _commandEnd = _output.Length;
                     break;
 
                 case OscParser.OscEventType.Cwd:
@@ -210,14 +210,17 @@ public class CommandTracker
                     break;
 
                 case OscParser.OscEventType.PromptStart:
-                    ScheduleResolve();
+                    Resolve();
                     break;
             }
         }
     }
 
     /// <summary>
-    /// Feed cleaned output from the PTY (OSC stripped).
+    /// Feed cleaned output from the PTY (OSC stripped). Always appends
+    /// during an AI command — the OSC C / OSC D position markers slice out
+    /// the useful portion at Resolve time, so we don't need conditional
+    /// capture or suppression flags here.
     /// </summary>
     public void FeedOutput(string text)
     {
@@ -225,8 +228,6 @@ public class CommandTracker
         {
             if (_isAiCommand)
             {
-                if (!_captureEnabled) return;
-
                 if (_output.Length < MaxOutputBytes)
                 {
                     _output += text;
@@ -263,15 +264,6 @@ public class CommandTracker
             _cachedResult = null;
             return result;
         }
-    }
-
-    private void ScheduleResolve()
-    {
-        // Resolve immediately on OSC PromptStart — no fixed settle delay.
-        // Trailing output that arrives after this (pwsh prompt repaint,
-        // Format-Table rows still streaming, etc.) lands in _postPrimaryOutput
-        // and the proxy drains it via the drain_post_output pipe message.
-        Resolve();
     }
 
     /// <summary>
@@ -392,47 +384,33 @@ public class CommandTracker
         }
     }
 
+    /// <summary>
+    /// Slice the command-output window out of _output and clean it up.
+    /// The window is [_commandStart, _commandEnd), filled in by OSC C and
+    /// OSC D. If OSC C never fired (parse error, OSC markers misconfigured)
+    /// we fall back to the whole buffer. If OSC D never fired but OSC A did
+    /// (unusual), we take everything up to _output.Length.
+    /// </summary>
     private string CleanOutput()
     {
-        var raw = _output;
+        var start = _commandStart >= 0 ? _commandStart : 0;
+        var end = _commandEnd >= 0 ? _commandEnd : _output.Length;
+        if (end < start) end = start;
+        if (end > _output.Length) end = _output.Length;
 
-        // For pwsh: everything before the first hard \r\n is AcceptLine rendering noise.
-        // (PSReadLine uses soft \r to overwrite ghost text; the \r\n marks end of input line.)
-        // Not applied to bash/zsh where OSC B is not emitted per-command.
-        if (_stripAcceptLineNoise)
-        {
-            int firstHardNewline = raw.IndexOf("\r\n");
-            if (firstHardNewline >= 0)
-                raw = raw[(firstHardNewline + 2)..];
-        }
+        var raw = _output.Substring(start, end - start);
 
         var output = StripAnsi(raw);
         var lines = output.Split('\n');
         var cleaned = new List<string>();
-
         foreach (var rawLine in lines)
         {
             var line = rawLine.TrimEnd('\r');
-
-            // Skip pwsh continuation prompt ">>" (with or without trailing space)
             var trimmed = line.TrimEnd();
-            if (trimmed == ">>" || trimmed.StartsWith(">> "))
-                continue;
-
+            // pwsh continuation prompt lines from multi-line input aren't
+            // command output and look jarring in the result.
+            if (trimmed == ">>" || trimmed.StartsWith(">> ")) continue;
             cleaned.Add(line);
-        }
-
-        // Remove trailing prompt/empty lines
-        while (cleaned.Count > 0)
-        {
-            var last = cleaned[^1].Trim();
-            if (string.IsNullOrEmpty(last) ||
-                last is "$" or "#" or "%" or ">>" ||
-                IsShellPrompt(last))
-            {
-                cleaned.RemoveAt(cleaned.Count - 1);
-            }
-            else break;
         }
 
         var result = string.Join('\n', cleaned).Trim();
@@ -465,8 +443,8 @@ public class CommandTracker
         _output = "";
         _commandSent = "";
         _stopwatch = null;
-        _captureEnabled = true;
-        _stripAcceptLineNoise = false;
+        _commandStart = -1;
+        _commandEnd = -1;
     }
 
     private static string StripAnsi(string text)

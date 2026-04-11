@@ -19,7 +19,15 @@ public class OscParser
 
     private string _buffer = "";
 
-    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null);
+    /// <summary>
+    /// A parsed OSC event. <see cref="TextOffset"/> is the index into
+    /// <see cref="ParseResult.Cleaned"/> where this event fired — i.e. the
+    /// number of cleaned bytes that came before it in the byte stream. It
+    /// lets consumers interleave FeedOutput and HandleEvent calls in the
+    /// exact order the shell wrote them, instead of feeding everything then
+    /// flushing events (which loses positional information).
+    /// </summary>
+    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0);
 
     public enum OscEventType
     {
@@ -105,7 +113,7 @@ public class OscParser
             var payload = input[searchFrom..endIdx];
             var evt = ParsePayload(payload);
             if (evt != null)
-                events.Add(evt);
+                events.Add(evt with { TextOffset = cleaned.Length });
 
             i = endIdx + endLen;
         }
