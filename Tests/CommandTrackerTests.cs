@@ -1,0 +1,116 @@
+using SplashShell.Services;
+
+namespace SplashShell.Tests;
+
+/// <summary>
+/// Unit tests for CommandTracker.Busy semantics — in particular, that user-initiated
+/// commands (OSCs fired without a preceding RegisterCommand) are also reflected in
+/// Busy so get_status reports "busy" and the proxy switches to a different console.
+/// </summary>
+public class CommandTrackerTests
+{
+    public static void Run()
+    {
+        var pass = 0;
+        var fail = 0;
+
+        void Assert(bool condition, string name)
+        {
+            if (condition) { pass++; Console.WriteLine($"  PASS: {name}"); }
+            else { fail++; Console.Error.WriteLine($"  FAIL: {name}"); }
+        }
+
+        Console.WriteLine("=== CommandTracker Tests ===");
+
+        static OscParser.OscEvent Evt(OscParser.OscEventType t, int exit = 0, string? cwd = null)
+            => new(t, exit, cwd);
+
+        // Test 1: fresh tracker is idle.
+        {
+            var t = new CommandTracker();
+            Assert(!t.Busy, "initial Busy is false");
+        }
+
+        // Test 2: pwsh user-command pattern — OSC B on Enter, OSC A after prompt.
+        {
+            var t = new CommandTracker();
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
+            Assert(t.Busy, "pwsh: Busy true after OSC B");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            Assert(t.Busy, "pwsh: still Busy after OSC C (fires from prompt fn after cmd)");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            Assert(t.Busy, "pwsh: still Busy after OSC D");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "C:\\Users"));
+            Assert(t.Busy, "pwsh: still Busy after OSC P");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            Assert(!t.Busy, "pwsh: Busy cleared by OSC A");
+        }
+
+        // Test 3: bash/zsh user-command pattern — OSC C on preexec, OSC D+A on precmd.
+        {
+            var t = new CommandTracker();
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            Assert(t.Busy, "bash: Busy true after OSC C (preexec)");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            Assert(t.Busy, "bash: still Busy after OSC D");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "/home/user"));
+            Assert(t.Busy, "bash: still Busy after OSC P");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            Assert(!t.Busy, "bash: Busy cleared by OSC A");
+        }
+
+        // Test 4: startup sequence (initial OSC B then first OSC A) clears back to idle.
+        {
+            var t = new CommandTracker();
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
+            Assert(t.Busy, "startup: Busy true after initial OSC B");
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            Assert(!t.Busy, "startup: Busy cleared by first OSC A");
+        }
+
+        // Test 5: LastKnownCwd is updated even for user-command OSC P.
+        {
+            var t = new CommandTracker();
+            Assert(t.LastKnownCwd == null, "LastKnownCwd starts null");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "/tmp"));
+            Assert(t.LastKnownCwd == "/tmp", "LastKnownCwd updated from user OSC P");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            Assert(t.LastKnownCwd == "/tmp", "LastKnownCwd retained after prompt");
+        }
+
+        // Test 6: AI command wins over user state — RegisterCommand while idle, then events
+        // still reflect Busy via _isAiCommand until the AI command resolves.
+        {
+            var t = new CommandTracker();
+            var task = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            Assert(t.Busy, "AI cmd: Busy true after RegisterCommand");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            Assert(t.Busy, "AI cmd: still Busy before prompt resolves");
+        }
+
+        // Test 7: RegisterCommand refuses when another AI command is in flight.
+        {
+            var t = new CommandTracker();
+            _ = t.RegisterCommand("first", timeoutMs: 30_000);
+            bool threw = false;
+            try { _ = t.RegisterCommand("second", timeoutMs: 30_000); }
+            catch (InvalidOperationException) { threw = true; }
+            Assert(threw, "AI cmd: second RegisterCommand throws");
+        }
+
+        Console.WriteLine($"\n{pass} passed, {fail} failed");
+        if (fail > 0) Environment.Exit(1);
+    }
+}

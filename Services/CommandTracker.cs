@@ -40,6 +40,7 @@ public class CommandTracker
     private TaskCompletionSource<CommandResult>? _tcs;
     private CancellationTokenRegistration _timeoutReg;
     private bool _isAiCommand;
+    private bool _userCommandBusy;
     private string _output = "";
     private bool _truncated;
     private int _exitCode;
@@ -57,7 +58,7 @@ public class CommandTracker
     private string? _lastKnownCwd;
     public string? LastKnownCwd { get { lock (_lock) return _lastKnownCwd; } }
 
-    public bool Busy => _isAiCommand;
+    public bool Busy => _isAiCommand || _userCommandBusy;
     public bool HasCachedOutput => _cachedResult != null;
 
     public record CommandResult(string Output, int ExitCode, string? Cwd, string? Command, string Duration);
@@ -134,7 +135,27 @@ public class CommandTracker
             if (evt.Type == OscParser.OscEventType.Cwd)
                 _lastKnownCwd = evt.Cwd;
 
-            if (!_isAiCommand) return;
+            // When no AI command is active, track whether the human user is
+            // mid-command in the terminal. OSC B / OSC C both mean "a command
+            // is about to start / is starting" (pwsh fires B on Enter, bash
+            // and zsh fire C from preexec); OSC A means the shell is back at
+            // a prompt. This lets get_status report "busy" for user commands
+            // too, so execute_command won't shove an AI command into a PTY
+            // that the human is actively using.
+            if (!_isAiCommand)
+            {
+                switch (evt.Type)
+                {
+                    case OscParser.OscEventType.CommandInputStart:
+                    case OscParser.OscEventType.CommandExecuted:
+                        _userCommandBusy = true;
+                        break;
+                    case OscParser.OscEventType.PromptStart:
+                        _userCommandBusy = false;
+                        break;
+                }
+                return;
+            }
 
             switch (evt.Type)
             {

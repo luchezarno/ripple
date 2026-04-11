@@ -28,6 +28,7 @@ public class Program
                 return;
             }
             Tests.OscParserTests.Run();
+            Tests.CommandTrackerTests.Run();
             if (args.Contains("--e2e"))
                 await Tests.ConsoleWorkerTests.Run();
             return;
