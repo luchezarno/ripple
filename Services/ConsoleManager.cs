@@ -429,9 +429,8 @@ public class ConsoleManager
                 var sourceDisplay = _consoles.GetValueOrDefault(initialActivePid)?.DisplayName ?? $"#{initialActivePid}";
                 var targetDisplay = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
                 routingNotice =
-                    $"Note: source console {sourceDisplay} was moved by user from '{sourceLastAiCwd}' to '{sourceCwd}'. " +
-                    $"Command ran in {targetDisplay} at your last known cwd '{sourceLastAiCwd}'. " +
-                    $"To follow the user's new cwd, include an explicit Set-Location/cd in your command or use absolute paths.";
+                    $"Note: source {sourceDisplay} was moved by user to '{sourceCwd}'; " +
+                    $"ran in {targetDisplay} at your last known cwd '{sourceLastAiCwd}'.";
             }
         }
         else if (isSwitching)
