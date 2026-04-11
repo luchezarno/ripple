@@ -259,6 +259,45 @@ public class ConsoleManager
 
     private async Task<ExecuteResult> ExecuteCommandInnerAsync(string command, int timeoutSeconds, string agentId, string? shell)
     {
+        var plan = await PlanExecutionAsync(command, agentId, shell);
+        if (plan.EarlyResult != null) return plan.EarlyResult;
+
+        return await ExecutePlannedCommandAsync(
+            consolePid: plan.ConsolePid,
+            pipeName: plan.PipeName,
+            command: command,
+            executedCommand: plan.ExecutedCommand,
+            timeoutSeconds: timeoutSeconds,
+            agentId: agentId,
+            shell: shell,
+            routingNotice: plan.RoutingNotice);
+    }
+
+    /// <summary>
+    /// Output of the routing phase. Either a concrete target console to run
+    /// the command on (ConsolePid + PipeName + ExecutedCommand, possibly with
+    /// a RoutingNotice that should be surfaced to the AI) or an EarlyResult
+    /// that short-circuits the execute entirely — used for the "switched, re-
+    /// execute" and "cwd drifted, verify" paths where the planner refuses to
+    /// run the command on the AI's behalf.
+    /// </summary>
+    private sealed record ExecutionPlan(
+        int ConsolePid,
+        string PipeName,
+        string ExecutedCommand,
+        string? RoutingNotice,
+        ExecuteResult? EarlyResult);
+
+    /// <summary>
+    /// Decide which console the command should run on, whether a cd preamble
+    /// is needed, and whether any drift / cross-shell-switch warning should
+    /// be surfaced. This is all side-effect-aware (MarkPipeBusy, LastAiCwd
+    /// updates, auto-starts via StartConsoleInnerAsync) because the decisions
+    /// and the state updates are entangled — separating them would just mean
+    /// the caller has to replay the decisions.
+    /// </summary>
+    private async Task<ExecutionPlan> PlanExecutionAsync(string command, string agentId, string? shell)
+    {
         // Resolve shell to full path for consistent matching
         var resolvedShell = shell != null ? ResolveShellPath(shell) : null;
 
@@ -446,13 +485,14 @@ public class ConsoleManager
             // no longer reach this branch — resolvedShell is pinned to the busy
             // source earlier, so the find/auto-start above stays same-family.
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
-            return new ExecuteResult
-            {
-                Pid = consolePid,
-                Switched = true,
-                DisplayName = displayName,
-                Output = $"Switched to console {displayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
-            };
+            return new ExecutionPlan(consolePid, pipeName, executedCommand, routingNotice,
+                EarlyResult: new ExecuteResult
+                {
+                    Pid = consolePid,
+                    Switched = true,
+                    DisplayName = displayName,
+                    Output = $"Switched to console {displayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
+                });
         }
         else
         {
@@ -470,25 +510,18 @@ public class ConsoleManager
             {
                 lock (_lock) { if (consoleInfo != null) consoleInfo.LastAiCwd = currentCwd; }
                 var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
-                return new ExecuteResult
-                {
-                    Pid = consolePid,
-                    Switched = true,
-                    DisplayName = displayName,
-                    Output = $"Console {displayName} cwd is now '{currentCwd}' (was '{lastAiCwd}'). Pipeline NOT executed — verify and re-execute.",
-                };
+                return new ExecutionPlan(consolePid, pipeName, executedCommand, routingNotice,
+                    EarlyResult: new ExecuteResult
+                    {
+                        Pid = consolePid,
+                        Switched = true,
+                        DisplayName = displayName,
+                        Output = $"Console {displayName} cwd is now '{currentCwd}' (was '{lastAiCwd}'). Pipeline NOT executed — verify and re-execute.",
+                    });
             }
         }
 
-        return await ExecutePlannedCommandAsync(
-            consolePid: consolePid,
-            pipeName: pipeName,
-            command: command,
-            executedCommand: executedCommand,
-            timeoutSeconds: timeoutSeconds,
-            agentId: agentId,
-            shell: shell,
-            routingNotice: routingNotice);
+        return new ExecutionPlan(consolePid, pipeName, executedCommand, routingNotice, EarlyResult: null);
     }
 
     /// <summary>
