@@ -887,19 +887,16 @@ public class ConsoleManager
                     w => w.WriteString("type", "get_status"),
                     TimeSpan.FromSeconds(3));
 
-                var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
                 var hasCached = statusResp.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
 
-                // If the worker is back at standby (not busy, no cache) but the
-                // proxy still has this pid flagged as busy, it's a stale entry
-                // from a previous lost/destroyed cache. Clear it so wait_for_completion
-                // stops polling a console that will never produce anything.
-                if (!hasCached && statusStr == "standby")
-                {
-                    UnmarkPipeBusy(agentId, pid.Value);
-                    continue;
-                }
-
+                // If there's no cached output, leave KnownBusyPids alone —
+                // CollectBusyStatusesAsync (called right after this in
+                // AppendCachedOutputs) will detect the busy→idle transition
+                // and emit a finished notification. Stale entries with a
+                // lost cache end up going through the same path and get
+                // surfaced as "finished" too, which is a little misleading
+                // but beats the old silent cleanup that swallowed real
+                // user-command finish events.
                 if (!hasCached) continue;
 
                 var cachedResp = await SendPipeRequestAsync(pipe,
@@ -942,19 +939,39 @@ public class ConsoleManager
         string? RunningCommand,
         double? ElapsedSeconds);
 
+    public record FinishedStatus(
+        int Pid,
+        string DisplayName,
+        string? ShellFamily);
+
+    public record BusyReport(
+        List<BusyStatus> Busy,
+        List<FinishedStatus> Finished);
+
     /// <summary>
     /// Report currently-busy consoles (other than any caller-excluded one)
-    /// so the caller can prepend their status to the next response. Only
-    /// includes pids we know are busy from KnownBusyPids — pipes whose status
-    /// query fails or that have gone quiet are dropped from the tracking set
-    /// as a side effect, keeping the set honest.
+    /// so the caller can prepend their status to the next response. Walks
+    /// every known console — not just KnownBusyPids — so that user-typed
+    /// commands which the proxy never explicitly tracked still surface in
+    /// the busy report. Newly-discovered busy consoles are added to
+    /// KnownBusyPids so the eventual idle transition lands in the Finished
+    /// list on a later call. Consoles that were previously reported as
+    /// busy but are now idle produce one "finished" notification and are
+    /// then unmarked.
     /// </summary>
-    public async Task<List<BusyStatus>> CollectBusyStatusesAsync(string agentId, int excludePid = 0)
+    public async Task<BusyReport> CollectBusyStatusesAsync(string agentId, int excludePid = 0)
     {
-        var report = new List<BusyStatus>();
-        var busyPids = SnapshotBusyPids(agentId);
+        var busyReport = new List<BusyStatus>();
+        var finishedReport = new List<FinishedStatus>();
 
-        foreach (var pid in busyPids)
+        var knownBusy = SnapshotBusyPids(agentId).ToHashSet();
+        List<int> allConsoles;
+        lock (_lock) allConsoles = _consoles.Keys.ToList();
+
+        var toCheck = new HashSet<int>(knownBusy);
+        foreach (var pid in allConsoles) toCheck.Add(pid);
+
+        foreach (var pid in toCheck)
         {
             if (pid == excludePid) continue;
 
@@ -984,15 +1001,28 @@ public class ConsoleManager
                     TimeSpan.FromSeconds(3));
 
                 var statusStr = statusResp.TryGetProperty("status", out var st) ? st.GetString() : null;
+                var wasKnownBusy = knownBusy.Contains(pid);
+
                 if (statusStr != "busy")
                 {
-                    // Worker is no longer running this command. Either the
-                    // result is already cached (drained elsewhere) or the
-                    // tracking was stale. CollectCachedOutputsAsync /
-                    // WaitForCompletionAsync will handle drains; here we just
-                    // skip — do not report a stale busy entry.
+                    // Idle now. Only emit a finished line if we'd previously
+                    // reported the console as busy — skip consoles that were
+                    // idle all along, otherwise every tool call for a user
+                    // with multiple standby consoles would spam finished
+                    // entries. AI commands that timed out and then completed
+                    // are drained by CollectCachedOutputs before this runs,
+                    // so they're gone from KnownBusyPids by now.
+                    if (wasKnownBusy)
+                    {
+                        UnmarkPipeBusy(agentId, pid);
+                        finishedReport.Add(new FinishedStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily));
+                    }
                     continue;
                 }
+
+                // Busy now. Mark it so the later transition to idle produces
+                // a finished notification even if nothing else tagged it.
+                if (!wasKnownBusy) MarkPipeBusy(agentId, pid);
 
                 // Prefer the proxy-tracked LastAiCommand (original user input)
                 // over the worker's runningCommand (which includes any cd
@@ -1005,16 +1035,16 @@ public class ConsoleManager
                     && esProp.ValueKind == JsonValueKind.Number)
                     elapsed = esProp.GetDouble();
 
-                report.Add(new BusyStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily, cmd, elapsed));
+                busyReport.Add(new BusyStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily, cmd, elapsed));
             }
             catch
             {
-                // Transient pipe error — keep the pid flagged, try again next
-                // time. Do not report a partial entry.
+                // Transient pipe error — leave any existing KnownBusy state
+                // alone so we retry next tick. Don't emit a partial entry.
             }
         }
 
-        return report;
+        return new BusyReport(busyReport, finishedReport);
     }
 
     // --- Wait for completion ---
@@ -1163,7 +1193,7 @@ public class ConsoleManager
         // per-tool background busy report uses, so the AI sees a consistent
         // `⧗ #pid Name (shell) | Status: Busy (Ns) | Pipeline: cmd` format
         // everywhere.
-        var stillBusy = await CollectBusyStatusesAsync(agentId);
+        var stillBusy = (await CollectBusyStatusesAsync(agentId)).Busy;
 
         return new WaitForCompletionResult(completed, stillBusy, HadNoBusyPids: false);
     }

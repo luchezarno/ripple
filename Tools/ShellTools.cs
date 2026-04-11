@@ -138,9 +138,9 @@ public class ShellTools
     {
         var closed = consoleManager.DetectClosedConsoles(agentId);
         var cached = await consoleManager.CollectCachedOutputsAsync(agentId);
-        var busy = await consoleManager.CollectBusyStatusesAsync(agentId, excludePid);
+        var report = await consoleManager.CollectBusyStatusesAsync(agentId, excludePid);
 
-        if (closed.Count == 0 && cached.Count == 0 && busy.Count == 0)
+        if (closed.Count == 0 && cached.Count == 0 && report.Busy.Count == 0 && report.Finished.Count == 0)
             return response;
 
         var sb = new StringBuilder();
@@ -153,12 +153,21 @@ public class ShellTools
             sb.AppendLine();
         }
 
-        // Other consoles still running a previously-started AI command
-        foreach (var b in busy)
+        // Other consoles still running a previously-started command
+        foreach (var b in report.Busy)
         {
             sb.AppendLine(FormatBusyLine(b));
         }
-        if (busy.Count > 0) sb.AppendLine();
+        if (report.Busy.Count > 0) sb.AppendLine();
+
+        // Consoles whose previously-reported busy command has now finished.
+        // Currently only fires for user-typed commands; AI commands with
+        // cached output are drained above and never reach this branch.
+        foreach (var f in report.Finished)
+        {
+            sb.AppendLine(FormatFinishedLine(f));
+        }
+        if (report.Finished.Count > 0) sb.AppendLine();
 
         // Cached command results (timed-out AI commands that have since completed)
         foreach (var r in cached)
@@ -183,5 +192,16 @@ public class ShellTools
         var elapsed = b.ElapsedSeconds.HasValue ? $" ({b.ElapsedSeconds.Value:F0}s)" : "";
         var cmd = string.IsNullOrEmpty(b.RunningCommand) ? "(user command)" : b.RunningCommand;
         return $"⧗ {b.DisplayName}{shell} | Status: Busy{elapsed} | Pipeline: {cmd}";
+    }
+
+    /// <summary>
+    /// One-line summary of a console whose previously-busy command has just
+    /// finished. Mirrors FormatBusyLine's shape so the two lines read
+    /// consistently when they appear together.
+    /// </summary>
+    private static string FormatFinishedLine(ConsoleManager.FinishedStatus f)
+    {
+        var shell = f.ShellFamily != null ? $" ({f.ShellFamily})" : "";
+        return $"✓ {f.DisplayName}{shell} | Status: User command finished";
     }
 }
