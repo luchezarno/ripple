@@ -181,22 +181,28 @@ public class ConsoleWorker
         // Monitor visible console window resizes and propagate to ConPTY
         var resizeTask = ResizeMonitorLoop(ct);
 
-        // Run owned + unowned pipe servers. When proxy dies, stop owned pipe,
-        // keep unowned running for re-claim by another proxy.
-        // On re-claim, start a new owned pipe for the new proxy.
+        // Run owned + unowned pipe servers. Two owned listeners share the
+        // pipe name via NamedPipeServerStream.MaxAllowedServerInstances — a
+        // long-running execute occupies one instance, the other stays free
+        // to handle get_status / get_cached_output without stalling. When
+        // the proxy dies, both owned instances are cancelled and the
+        // unowned pipe keeps running for re-claim by another proxy.
+        const int OwnedListenerCount = 2;
         while (!ct.IsCancellationRequested && !_obsolete)
         {
             using var ownedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var ownedTask = RunPipeServerAsync(_pipeName, ownedCts.Token);
+            var ownedTasks = new Task[OwnedListenerCount];
+            for (int i = 0; i < OwnedListenerCount; i++)
+                ownedTasks[i] = RunPipeServerAsync(_pipeName, ownedCts.Token);
             var unownedTask = RunPipeServerAsync(_unownedPipeName, ct);
             var monitorTask = MonitorParentProxyAsync(ct);
 
             // Wait for proxy death or external cancellation
             await monitorTask;
 
-            // Proxy died — stop owned pipe, keep unowned running
+            // Proxy died — stop owned listeners, keep unowned running
             ownedCts.Cancel();
-            await ownedTask.ContinueWith(_ => { });
+            await Task.WhenAll(ownedTasks).ContinueWith(_ => { });
 
             // Wait for re-claim via unowned pipe (blocks until _claimTcs is set)
             _claimTcs = new TaskCompletionSource<string>();
@@ -821,17 +827,24 @@ public class ConsoleWorker
             NamedPipeServerStream server;
             try
             {
+                // Multiple server instances share the same pipe name so a
+                // long-running execute on one instance doesn't starve
+                // get_status / get_cached_output arriving on another. The
+                // instance count caps at NamedPipeServerStream.MaxAllowedServerInstances
+                // (~256 on Windows) but the worker only spawns a fixed few
+                // listening loops (see RunAsync), so the cap is never hit.
                 server = new NamedPipeServerStream(
                     pipeName,
                     PipeDirection.InOut,
-                    1,
+                    NamedPipeServerStream.MaxAllowedServerInstances,
                     PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous);
             }
-            catch (IOException)
+            catch (IOException ex)
             {
-                // Pipe name in use (e.g. another worker on the same PID — should not happen)
-                return;
+                Log($"Pipe create error: {ex.Message}");
+                try { await Task.Delay(500, ct); } catch (OperationCanceledException) { break; }
+                continue;
             }
             using var _server = server;
 
@@ -928,8 +941,21 @@ public class ConsoleWorker
             _tracker.SuppressUntilCommandStart();
         }
 
-        // Register command with tracker (it will resolve when OSC PromptStart arrives)
-        var resultTask = _tracker.RegisterCommand(command, timeoutMs);
+        // Register command with tracker (it will resolve when OSC PromptStart arrives).
+        // With concurrent pipe listeners, two execute requests can race between
+        // the `_tracker.Busy` check above and here — the tracker's internal lock
+        // serialises RegisterCommand and throws if another command is already
+        // registered. Turn that back into a clean "busy" response so the proxy
+        // routes the loser to a different console instead of surfacing an error.
+        Task<CommandTracker.CommandResult> resultTask;
+        try
+        {
+            resultTask = _tracker.RegisterCommand(command, timeoutMs);
+        }
+        catch (InvalidOperationException)
+        {
+            return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
+        }
 
         await WriteToPty(command + enter, ct);
 
