@@ -41,6 +41,7 @@ public class CommandTracker
     private CancellationTokenRegistration _timeoutReg;
     private bool _isAiCommand;
     private bool _userCommandBusy;
+    private bool _shellReady; // flipped on first PromptStart; gates user-busy tracking
     private string _output = "";
     private bool _truncated;
     private int _exitCode;
@@ -135,6 +136,14 @@ public class CommandTracker
             if (evt.Type == OscParser.OscEventType.Cwd)
                 _lastKnownCwd = evt.Cwd;
 
+            // Mark the shell as "ready" on the first PromptStart. Until then,
+            // ignore user-command busy transitions — the initial OSC B that
+            // integration scripts emit at startup (and the subsequent prompt
+            // setup) would otherwise leave the new console looking busy and
+            // cause HandleExecuteAsync to reject the first incoming command.
+            if (evt.Type == OscParser.OscEventType.PromptStart)
+                _shellReady = true;
+
             // When no AI command is active, track whether the human user is
             // mid-command in the terminal. OSC B / OSC C both mean "a command
             // is about to start / is starting" (pwsh fires B on Enter, bash
@@ -144,6 +153,8 @@ public class CommandTracker
             // that the human is actively using.
             if (!_isAiCommand)
             {
+                if (!_shellReady) return;
+
                 switch (evt.Type)
                 {
                     case OscParser.OscEventType.CommandInputStart:

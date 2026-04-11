@@ -31,11 +31,25 @@ public class CommandTrackerTests
             Assert(!t.Busy, "initial Busy is false");
         }
 
+        // Helper: simulate shell startup (initial OSC B then first OSC A) so
+        // subsequent OSC B/C events are recognised as user commands. The
+        // tracker gates user-busy tracking until the shell has reached its
+        // first prompt, otherwise the startup OSC B would leave new consoles
+        // looking busy.
+        static void PrimeShellReady(CommandTracker t)
+        {
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.CommandInputStart));
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.PromptStart));
+        }
+
         // Test 2: pwsh user-command pattern — OSC B on Enter, OSC A after prompt.
         {
             var t = new CommandTracker();
+            PrimeShellReady(t);
+            Assert(!t.Busy, "pwsh: idle after startup B → A");
+
             t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
-            Assert(t.Busy, "pwsh: Busy true after OSC B");
+            Assert(t.Busy, "pwsh: Busy true after OSC B (Enter)");
 
             t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
             Assert(t.Busy, "pwsh: still Busy after OSC C (fires from prompt fn after cmd)");
@@ -53,6 +67,9 @@ public class CommandTrackerTests
         // Test 3: bash/zsh user-command pattern — OSC C on preexec, OSC D+A on precmd.
         {
             var t = new CommandTracker();
+            PrimeShellReady(t);
+            Assert(!t.Busy, "bash: idle after startup B → A");
+
             t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
             Assert(t.Busy, "bash: Busy true after OSC C (preexec)");
 
@@ -66,13 +83,18 @@ public class CommandTrackerTests
             Assert(!t.Busy, "bash: Busy cleared by OSC A");
         }
 
-        // Test 4: startup sequence (initial OSC B then first OSC A) clears back to idle.
+        // Test 4: startup OSC B must NOT mark busy before the shell is ready.
+        // Before the first OSC A there is no established baseline, and the
+        // initial OSC B from integration scripts would otherwise race against
+        // the first execute_command from the proxy.
         {
             var t = new CommandTracker();
             t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
-            Assert(t.Busy, "startup: Busy true after initial OSC B");
+            Assert(!t.Busy, "startup: initial OSC B is ignored (shell not ready)");
             t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
-            Assert(!t.Busy, "startup: Busy cleared by first OSC A");
+            Assert(!t.Busy, "startup: still idle after first OSC A");
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
+            Assert(t.Busy, "startup: OSC B after first prompt does set busy");
         }
 
         // Test 5: LastKnownCwd is updated even for user-command OSC P.
@@ -80,6 +102,7 @@ public class CommandTrackerTests
             var t = new CommandTracker();
             Assert(t.LastKnownCwd == null, "LastKnownCwd starts null");
 
+            PrimeShellReady(t);
             t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
             t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "/tmp"));
             Assert(t.LastKnownCwd == "/tmp", "LastKnownCwd updated from user OSC P");

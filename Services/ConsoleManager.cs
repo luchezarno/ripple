@@ -302,7 +302,13 @@ public class ConsoleManager
                         w => w.WriteString("type", "get_status"), TimeSpan.FromSeconds(3));
                     sourceCwd = statusResp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
                     var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
-                    activeBusy = statusStr == "busy";
+                    // "completed" = worker still has an undelivered cached result from a
+                    // previous timed-out AI command. If we execute here, RegisterCommand
+                    // wipes _cachedResult and the drain via AppendCachedOutputs finds
+                    // nothing — the result is lost and KnownBusyPids never clears.
+                    // Route away instead; the cache will be drained at the end of this
+                    // tool call like any other pending output.
+                    activeBusy = statusStr == "busy" || statusStr == "completed";
                 }
                 catch { }
             }
@@ -620,7 +626,11 @@ public class ConsoleManager
                     TimeSpan.FromSeconds(3));
 
                 var status = response.TryGetProperty("status", out var sp) ? sp.GetString() : null;
-                if (status is not ("standby" or "completed")) continue;
+                // Only truly idle consoles are reusable. "completed" has a cached
+                // AI result that the next execute would destroy via RegisterCommand
+                // — let the drain-at-end-of-tool path handle it; we'll auto-start
+                // a fresh console for the new command instead.
+                if (status != "standby") continue;
 
                 // Shell path filter: match by full path (tracked consoles) or family (unowned)
                 if (shellPath != null)
@@ -793,7 +803,19 @@ public class ConsoleManager
                     w => w.WriteString("type", "get_status"),
                     TimeSpan.FromSeconds(3));
 
+                var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
                 var hasCached = statusResp.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
+
+                // If the worker is back at standby (not busy, no cache) but the
+                // proxy still has this pid flagged as busy, it's a stale entry
+                // from a previous lost/destroyed cache. Clear it so wait_for_completion
+                // stops polling a console that will never produce anything.
+                if (!hasCached && statusStr == "standby")
+                {
+                    UnmarkPipeBusy(agentId, pid.Value);
+                    continue;
+                }
+
                 if (!hasCached) continue;
 
                 var cachedResp = await SendPipeRequestAsync(pipe,
@@ -918,7 +940,19 @@ public class ConsoleManager
                         w => w.WriteString("type", "get_status"),
                         TimeSpan.FromSeconds(3));
 
+                    var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
                     var hasCached = statusResp.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
+
+                    // Worker is back at standby with nothing to deliver — the
+                    // previous AI command's cache was lost/destroyed. Stop
+                    // waiting; there will never be a result to drain.
+                    if (!hasCached && statusStr == "standby")
+                    {
+                        UnmarkPipeBusy(agentId, pid);
+                        busyPids.RemoveAt(i);
+                        continue;
+                    }
+
                     if (!hasCached) continue;
 
                     var cachedResp = await SendPipeRequestAsync(pipeName,

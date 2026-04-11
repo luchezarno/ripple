@@ -112,11 +112,21 @@ public class ConsoleWorker
         // Shell-specific Enter key: Unix shells use \n, Windows shells use \r
         var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
 
-        if (shellName is "pwsh" or "powershell" or "cmd")
+        if (shellName is "cmd")
         {
-            // pwsh/cmd: injection done via BuildCommandLine (-Command / /k prompt).
-            // Kick an Enter to trigger the first prompt + OSC markers.
+            // cmd.exe with /k prompt doesn't paint the first prompt until it
+            // reads input. Send a harmless Enter so the OSC-aware prompt runs
+            // and the proxy can pick up the cwd marker.
             await WriteToPty(enter, ct);
+        }
+        else if (shellName is "pwsh" or "powershell")
+        {
+            // pwsh with -NoExit -Command paints its first prompt automatically
+            // when -Command finishes, so the OSC markers fire without any
+            // external kick. Sending a spurious Enter here would run the
+            // PSReadLine Enter handler, emit an OSC B, and leave CommandTracker
+            // in "user busy" state right before the proxy's first execute
+            // request arrives — causing HandleExecuteAsync to reject it.
         }
         else
         {
