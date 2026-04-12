@@ -14,23 +14,23 @@ Most MCP tool servers run each command in an isolated subprocess — no state ca
 
 splashshell gives AI assistants a real, continuous shell session where all of this persists:
 
-### Persistent connection context
+### Module import cost
 
-PowerShell service modules require a `Connect-*` call to establish an in-memory connection context before their cmdlets work. Some modules cache credentials to disk (Az caches tokens in `~/.Azure/`, AWS stores profiles in `~/.aws/credentials`), but the **session-scoped context object** must still be created each time a new process starts. Without session persistence, the AI would need to call `Connect-AzAccount` (which can take several seconds even with cached tokens) before every command:
+PowerShell modules aren't free to load. `Import-Module Az` can take **5–10 seconds**; `Microsoft.Graph` is similarly heavy. In an isolated-subprocess model, every command pays this cost. With splashshell, the AI imports once and the module stays loaded — every subsequent cmdlet call is instant:
 
 ```powershell
-# Command 1: establish connection context (reads cached tokens, sets up session)
-Connect-AzAccount
+# Command 1: one-time cost (~8 seconds)
+Import-Module Az.Compute, Az.Storage
 
-# Command 2 (minutes later): context is live — no re-connect needed
+# Command 2 (instant — module already loaded)
 Get-AzVM -Status | Where-Object PowerState -eq "VM running" |
     Select-Object Name, @{N='Size';E={$_.HardwareProfile.VmSize}}, Location
 
-# Command 3 (hours later): still connected
+# Command 3 (instant)
 Get-AzStorageAccount | Select-Object StorageAccountName, Location, Kind
 ```
 
-This applies to Azure (`Connect-AzAccount`), Microsoft 365 (`Connect-MgGraph`), Exchange Online (`Connect-ExchangeOnline`), SharePoint (`Connect-PnPOnline`), and more. With splashshell, the AI connects once and the context stays alive for the entire session.
+[PowerShell Gallery](https://www.powershellgallery.com/) offers 10,000+ modules — Az, AWS.Tools, Microsoft.Graph, ExchangeOnlineManagement, PnP.PowerShell, and more. Plus any CLI tool (git, docker, kubectl, terraform, gh) is available in the same session.
 
 ### Object pipeline across calls
 
