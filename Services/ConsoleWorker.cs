@@ -1474,7 +1474,7 @@ public class ConsoleWorker
         });
     }
 
-    private static string UnescapeInput(string input)
+    internal static string UnescapeInput(string input)
     {
         var sb = new StringBuilder(input.Length);
         for (int i = 0; i < input.Length; i++)

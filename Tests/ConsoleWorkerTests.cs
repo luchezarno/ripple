@@ -12,6 +12,36 @@ namespace SplashShell.Tests;
 /// </summary>
 public class ConsoleWorkerTests
 {
+    /// <summary>
+    /// Quick unit tests for UnescapeInput — runs without PTY/pipe setup.
+    /// </summary>
+    public static void RunUnitTests()
+    {
+        var pass = 0;
+        var fail = 0;
+        void Assert(bool condition, string name)
+        {
+            if (condition) { pass++; Console.WriteLine($"  PASS: {name}"); }
+            else { fail++; Console.Error.WriteLine($"  FAIL: {name}"); }
+        }
+
+        Console.WriteLine("=== ConsoleWorker Unit Tests ===");
+
+        // UnescapeInput
+        Assert(ConsoleWorker.UnescapeInput("hello") == "hello", "unescape: plain text unchanged");
+        Assert(ConsoleWorker.UnescapeInput("abc\\r") == "abc\r", "unescape: \\r → CR");
+        Assert(ConsoleWorker.UnescapeInput("abc\\n") == "abc\n", "unescape: \\n → LF");
+        Assert(ConsoleWorker.UnescapeInput("abc\\t") == "abc\t", "unescape: \\t → TAB");
+        Assert(ConsoleWorker.UnescapeInput("\\x03") == "\x03", "unescape: \\x03 → ETX");
+        Assert(ConsoleWorker.UnescapeInput("\\x1b[A") == "\x1b[A", "unescape: \\x1b[A → ESC[A");
+        Assert(ConsoleWorker.UnescapeInput("a\\\\b") == "a\\b", "unescape: \\\\\\\\ → literal backslash");
+        Assert(ConsoleWorker.UnescapeInput("\\r").Length == 1, "unescape: \\r length is 1");
+        Assert(ConsoleWorker.UnescapeInput("\\x03").Length == 1, "unescape: \\x03 length is 1");
+
+        Console.WriteLine($"\n{pass} passed, {fail} failed");
+        if (fail > 0) Environment.Exit(1);
+    }
+
     public static async Task Run()
     {
         var pass = 0;

@@ -149,7 +149,7 @@ public class ShellTools
             return $"No console matches \"{console}\". Use the display name (e.g. \"Poseidon\") or PID shown in previous tool responses.";
 
         if (result.Status == "ok")
-            return $"✓ Sent {input.Length} char(s) to {result.DisplayName}.";
+            return $"✓ Sent to {result.DisplayName}.";
         if (result.Status == "rejected")
             return $"✗ {result.DisplayName} is not busy. Use execute_command to run commands on idle consoles.";
         return $"✗ {result.DisplayName}: {result.Error}";
