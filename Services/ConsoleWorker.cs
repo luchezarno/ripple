@@ -512,12 +512,106 @@ public class ConsoleWorker
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool ReadConsoleW(IntPtr hConsoleInput, char[] lpBuffer, uint nNumberOfCharsToRead, out uint lpNumberOfCharsRead, IntPtr pInputControl);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleScreenBufferInfo(IntPtr hConsoleOutput, out CONSOLE_SCREEN_BUFFER_INFO lpConsoleScreenBufferInfo);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool ReadConsoleOutputCharacterW(IntPtr hConsoleOutput, char[] lpCharacter, uint nLength, SCREEN_COORD dwReadCoord, out uint lpNumberOfCharsRead);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SCREEN_COORD { public short X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CONSOLE_SCREEN_BUFFER_INFO
+    {
+        public SCREEN_COORD dwSize;
+        public SCREEN_COORD dwCursorPosition;
+        public short wAttributes;
+        public SMALL_RECT srWindow;
+        public SCREEN_COORD dwMaximumWindowSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SMALL_RECT
+    {
+        public short Left, Top, Right, Bottom;
+    }
+
     private const int STD_INPUT_HANDLE = -10;
     private const int STD_OUTPUT_HANDLE = -11;
     // VT input: arrow keys become \x1b[A etc., no line buffering, no echo
     private const uint ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
     private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
     private const uint DISABLE_NEWLINE_AUTO_RETURN = 0x0008;
+
+    /// <summary>
+    /// Read the visible portion of the worker's console screen buffer
+    /// via Win32 API. Returns the screen content as a multi-line string
+    /// with trailing whitespace trimmed per row and trailing empty rows
+    /// dropped. Returns null if the API call fails or on non-Windows
+    /// platforms (caller should fall back to VT-lite ring snapshot).
+    ///
+    /// This is the primary peek mechanism on Windows: it reads exactly
+    /// what the user sees in the terminal window, with no VT parsing
+    /// needed. PSReadLine prediction artifacts, cursor-dance noise,
+    /// and ConPTY redraw patterns are all invisible because the
+    /// console host has already rendered them into the final cell grid.
+    /// </summary>
+    private static string? ReadConsoleScreenText()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+
+        try
+        {
+            var hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (hOut == IntPtr.Zero || hOut == (IntPtr)(-1)) return null;
+            if (!GetConsoleScreenBufferInfo(hOut, out var info)) return null;
+
+            // Read the visible window portion of the buffer.
+            int width = info.srWindow.Right - info.srWindow.Left + 1;
+            int height = info.srWindow.Bottom - info.srWindow.Top + 1;
+            if (width <= 0 || height <= 0) return null;
+
+            var sb = new StringBuilder();
+            var rowBuf = new char[width];
+
+            // Track last non-blank row to trim trailing empties.
+            int lastNonBlankRow = -1;
+            var rows = new List<string>(height);
+
+            for (int row = 0; row < height; row++)
+            {
+                var coord = new SCREEN_COORD
+                {
+                    X = (short)(info.srWindow.Left),
+                    Y = (short)(info.srWindow.Top + row)
+                };
+                if (!ReadConsoleOutputCharacterW(hOut, rowBuf, (uint)width, coord, out var charsRead))
+                    return null;
+
+                // Trim trailing spaces for this row.
+                int end = (int)charsRead - 1;
+                while (end >= 0 && rowBuf[end] == ' ') end--;
+
+                var line = end >= 0 ? new string(rowBuf, 0, end + 1) : "";
+                rows.Add(line);
+                if (line.Length > 0) lastNonBlankRow = row;
+            }
+
+            if (lastNonBlankRow < 0) return "";
+
+            for (int r = 0; r <= lastNonBlankRow; r++)
+            {
+                if (r > 0) sb.Append('\n');
+                sb.Append(rows[r]);
+            }
+            return sb.ToString();
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// Enable VT escape sequence processing on the worker's stdout console
@@ -1017,7 +1111,11 @@ public class ConsoleWorker
             "get_cached_output" => HandleGetCachedOutput(),
             "peek" => SerializeResponse(w =>
             {
-                var snapshot = _tracker.GetRecentOutputSnapshot();
+                // On Windows, prefer reading the console screen buffer
+                // directly — this gives us exactly what the user sees,
+                // with no VT-lite parsing artifacts. On other platforms
+                // fall back to the ring buffer + VT-lite interpreter.
+                var snapshot = ReadConsoleScreenText() ?? _tracker.GetRecentOutputSnapshot();
                 w.WriteString("status", Status);
                 w.WriteBoolean("busy", _tracker.Busy);
                 w.WriteStringOrNull("runningCommand", _tracker.RunningCommand);
