@@ -141,9 +141,10 @@ public class ShellTools
         var peek = await consoleManager.PeekConsoleAsync(agentId, console, raw);
         if (peek == null)
         {
-            if (!string.IsNullOrEmpty(console))
-                return $"No console matches \"{console}\". Use the display name (e.g. \"Reggae\") or PID shown in previous tool responses.";
-            return "No console to peek at. Start one with start_console first.";
+            var msg = !string.IsNullOrEmpty(console)
+                ? $"No console matches \"{console}\". Use the display name (e.g. \"Reggae\") or PID shown in previous tool responses."
+                : "No console to peek at. Start one with start_console first.";
+            return await AppendCachedOutputs(consoleManager, agentId, msg);
         }
 
         var shellInfo = peek.ShellFamily != null ? $" ({peek.ShellFamily})" : "";
@@ -189,7 +190,8 @@ public class ShellTools
             }
             sb.Append(hex.ToString());
         }
-        return sb.ToString();
+
+        return await AppendCachedOutputs(consoleManager, agentId, sb.ToString(), excludePid: peek.Pid);
     }
 
     /// <summary>
