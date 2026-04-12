@@ -14,23 +14,23 @@ Most MCP tool servers run each command in an isolated subprocess — no state ca
 
 splashshell gives AI assistants a real, continuous shell session where all of this persists:
 
-### Persistent authentication
+### Persistent connection context
 
-PowerShell modules store authentication tokens **in the session**. Without persistence, the AI would need to re-authenticate before every single call:
+PowerShell service modules require a `Connect-*` call to establish an in-memory connection context before their cmdlets work. Some modules cache credentials to disk (Az caches tokens in `~/.Azure/`, AWS stores profiles in `~/.aws/credentials`), but the **session-scoped context object** must still be created each time a new process starts. Without session persistence, the AI would need to call `Connect-AzAccount` (which can take several seconds even with cached tokens) before every command:
 
 ```powershell
-# Command 1: authenticate (interactive browser flow, MFA, etc.)
+# Command 1: establish connection context (reads cached tokens, sets up session)
 Connect-AzAccount
 
-# Command 2 (minutes later): session is still alive — no re-auth
+# Command 2 (minutes later): context is live — no re-connect needed
 Get-AzVM -Status | Where-Object PowerState -eq "VM running" |
     Select-Object Name, @{N='Size';E={$_.HardwareProfile.VmSize}}, Location
 
-# Command 3 (hours later): still authenticated
+# Command 3 (hours later): still connected
 Get-AzStorageAccount | Select-Object StorageAccountName, Location, Kind
 ```
 
-This applies to every PowerShell service module: Azure (`Connect-AzAccount`), AWS (`Set-AWSCredential`), Microsoft 365 (`Connect-MgGraph`), Exchange Online (`Connect-ExchangeOnline`), SharePoint (`Connect-PnPOnline`), and more.
+This applies to Azure (`Connect-AzAccount`), Microsoft 365 (`Connect-MgGraph`), Exchange Online (`Connect-ExchangeOnline`), SharePoint (`Connect-PnPOnline`), and more. With splashshell, the AI connects once and the context stays alive for the entire session.
 
 ### Object pipeline across calls
 
