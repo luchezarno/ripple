@@ -14,7 +14,7 @@ Most shell MCP servers fall into one of two buckets: **stateless** (each command
 
 splashshell opens a **real, visible terminal window**. When the AI runs a command, you see it happen in real time — the same characters, the same output, the same prompt. You can type into the same terminal at any time. The AI can see what you typed via `peek_console`. This isn't a web dashboard or a log viewer — it's the actual terminal.
 
-No other standalone MCP server does this. Headless PTY servers like [interactive-shell-mcp](https://github.com/lightos/interactive-shell-mcp) give the AI a terminal it can peek at and send input to, but you as the user can't see or interact with it. tmux-based servers like [tmux-mcp](https://github.com/nickgnd/tmux-mcp) require tmux and don't run on Windows. splashshell's shared console works on Windows out of the box and doesn't need any external tools.
+Most shell MCP servers use a headless PTY that the user can't see. splashshell takes the opposite approach: full transparency, full control, no external dependencies.
 
 ### The AI can see the screen and respond to it
 
