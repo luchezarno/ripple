@@ -79,6 +79,7 @@ capabilities:
   async_output: false
   exit_code: unreliable      # always reported as 0 -- cmd limitation
   cwd_tracking: true
+  cwd_format: windows_native
   job_control: false
   shell_integration: osc633
   user_busy_detection: process_polling

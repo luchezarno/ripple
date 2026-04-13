@@ -283,6 +283,25 @@ public class CapabilitiesSpec
     public string ExitCode { get; set; } = "false";
 
     public bool CwdTracking { get; set; }
+
+    /// <summary>
+    /// Shape of the cwd strings this adapter's shell reports.
+    ///
+    /// <c>windows_native</c> — Windows-style absolute paths
+    /// (<c>C:\foo</c>). These can be handed to CreateProcess's
+    /// <c>lpCurrentDirectory</c> parameter directly, so splash can
+    /// spawn a replacement console straight into a cached dead-cwd.
+    /// pwsh / powershell / cmd / python-on-Windows / node-on-Windows.
+    ///
+    /// <c>posix</c> — POSIX paths (<c>/mnt/c/foo</c>, <c>/home/u</c>).
+    /// Not valid as a Win32 working directory. splash injects a
+    /// <c>cd</c> preamble at the command level instead. bash / zsh
+    /// under WSL, MSYS2, Git Bash.
+    ///
+    /// <c>none</c> — adapter does not track cwd at all.
+    /// </summary>
+    public string CwdFormat { get; set; } = "none";
+
     public bool JobControl { get; set; }
     public string? ShellIntegration { get; set; }
     public string? UserBusyDetection { get; set; }   // osc_b | process_polling | none

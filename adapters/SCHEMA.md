@@ -397,6 +397,7 @@ Feature flags that the runtime and MCP clients can query.
 | `async_output` | bool | Background concurrency can produce output between commands |
 | `exit_code` | `true` \| `false` \| `unreliable` | Exit code fidelity. `unreliable` means always 0 (cmd's limitation) |
 | `cwd_tracking` | bool | Adapter emits cwd updates via OSC P (or equivalent) |
+| `cwd_format` | `windows_native` \| `posix` \| `none` | Shape of reported cwd strings. `windows_native` (`C:\foo`) can be passed to CreateProcess's `lpCurrentDirectory` directly; `posix` (`/mnt/c/foo`, `/home/u`) forces splash to inject a `cd` preamble at the command level when spawning a replacement console. Only meaningful when `cwd_tracking: true`. |
 | `job_control` | bool | `&`, `fg`, `bg`, Ctrl-Z suspend work |
 | `shell_integration` | string \| null | Protocol name: `osc633`, `iterm2`, `kitty`, or null |
 | `user_busy_detection` | enum | How to detect the user is typing: `osc_b`, `process_polling`, `none` |

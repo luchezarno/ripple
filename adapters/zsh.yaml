@@ -81,6 +81,7 @@ capabilities:
   async_output: false
   exit_code: true
   cwd_tracking: true
+  cwd_format: posix
   job_control: true
   shell_integration: osc633
   user_busy_detection: osc_b

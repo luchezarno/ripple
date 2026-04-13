@@ -468,7 +468,19 @@ public class ConsoleManager
                 // (/mnt/c/... or /c/...) that CreateProcess can't use as
                 // a working directory.
                 var targetShellPath = resolvedShell ?? GetDefaultShell();
-                if (cachedDeadCwd != null && IsWindowsNativeShellFamily(NormalizeShellFamily(targetShellPath)))
+                // Only shells that report cwd in Windows-native form
+                // (pwsh/powershell/cmd, and REPLs on Windows that use
+                // process.cwd() / os.getcwd()) can have their cached
+                // dead cwd handed straight to CreateProcess's
+                // lpCurrentDirectory. For posix-cwd shells (bash/zsh
+                // via WSL or MSYS2) the path would be /mnt/c/... which
+                // Win32 rejects — those fall through to the preamble
+                // branch below. Phase C(postscript): this is the last
+                // hardcoded shell-family helper in ConsoleManager; the
+                // adapter capability takes over.
+                var targetAdapter = AdapterRegistry.Default?.Find(NormalizeShellFamily(targetShellPath));
+                var targetCwdFormat = targetAdapter?.Capabilities.CwdFormat ?? "none";
+                if (cachedDeadCwd != null && targetCwdFormat == "windows_native")
                 {
                     var startResult = await StartConsoleInnerAsync(targetShellPath, cachedDeadCwd, null, agentId);
                     consolePid = startResult.Pid;
@@ -1826,19 +1838,6 @@ public class ConsoleManager
     /// </summary>
     internal static string NormalizeShellFamily(string shell)
         => Path.GetFileNameWithoutExtension(shell).ToLowerInvariant();
-
-    /// <summary>
-    /// True for shells whose cwd format matches what Windows CreateProcess
-    /// expects as a workingDirectory parameter — pwsh, powershell and cmd
-    /// all report and accept Windows-native paths (`C:\foo`). bash and
-    /// zsh on Windows (WSL, MSYS2, Git Bash) are excluded because they
-    /// report POSIX paths (`/mnt/c/foo`, `/c/foo`) that CreateProcess
-    /// can't use directly. Used by the auto-start path to decide whether
-    /// a cached cwd can be handed to the new console via workingDirectory
-    /// instead of injected as a cd preamble.
-    /// </summary>
-    internal static bool IsWindowsNativeShellFamily(string shellName)
-        => shellName is "pwsh" or "powershell" or "cmd";
 
     /// <summary>
     /// Resolve a shell name to its full path. If already rooted, returns as-is.

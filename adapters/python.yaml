@@ -130,6 +130,7 @@ capabilities:
   # command and document exit_code as unreliable.
   exit_code: "unreliable"
   cwd_tracking: true
+  cwd_format: windows_native
   job_control: false
   shell_integration: osc633
   # Python's stdlib has no stable pre-input hook, so we can't emit OSC B
