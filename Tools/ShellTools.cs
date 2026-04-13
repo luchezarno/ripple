@@ -235,6 +235,14 @@ public class ShellTools
         var shell = r.ShellFamily != null ? $" ({r.ShellFamily})" : "";
         var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
         var cmd = r.Command?.Trim() is { Length: > 60 } c ? c[..60] + "..." : r.Command?.Trim();
+
+        // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
+        // worker always reports ExitCode=0 for cmd. Showing a success tick
+        // would mislead the AI into thinking every cmd command succeeded —
+        // render a neutral "Finished" line with no success/failure marker.
+        if (r.ShellFamily == "cmd")
+            return $"○ {r.DisplayName}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
+
         return r.ExitCode == 0
             ? $"✓ {r.DisplayName}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}"
             : $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}) | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
