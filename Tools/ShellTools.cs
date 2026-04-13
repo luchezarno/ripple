@@ -65,7 +65,8 @@ public class ShellTools
         if (result.TimedOut)
         {
             var shellInfo = result.ShellFamily != null ? $" ({result.ShellFamily})" : "";
-            var header = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";
+            var cmd = result.Command?.Trim() is { Length: > 60 } c ? c[..60] + "..." : result.Command?.Trim();
+            var header = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {cmd}\nUse wait_for_completion tool to wait and retrieve the result.";
             if (!string.IsNullOrEmpty(result.PartialOutput))
                 response = $"{header}\n\n--- partial output (recent window, not the final result) ---\n{result.PartialOutput}";
             else
@@ -186,7 +187,8 @@ public class ShellTools
             var elapsedPart = peek.RunningElapsedSeconds.HasValue
                 ? $" ({peek.RunningElapsedSeconds.Value:F1}s elapsed)"
                 : "";
-            sb.AppendLine($"Running: {peek.RunningCommand}{elapsedPart}");
+            var peekCmd = peek.RunningCommand.Trim() is { Length: > 60 } pc ? pc[..60] + "..." : peek.RunningCommand.Trim();
+            sb.AppendLine($"Running: {peekCmd}{elapsedPart}");
         }
         else if (peek.Busy)
         {
@@ -232,9 +234,10 @@ public class ShellTools
     {
         var shell = r.ShellFamily != null ? $" ({r.ShellFamily})" : "";
         var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
+        var cmd = r.Command?.Trim() is { Length: > 60 } c ? c[..60] + "..." : r.Command?.Trim();
         return r.ExitCode == 0
-            ? $"✓ {r.DisplayName}{shell} | Status: Completed | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}"
-            : $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}) | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}";
+            ? $"✓ {r.DisplayName}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}"
+            : $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}) | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
     }
 
     /// <summary>
@@ -300,7 +303,8 @@ public class ShellTools
     {
         var shell = b.ShellFamily != null ? $" ({b.ShellFamily})" : "";
         var elapsed = b.ElapsedSeconds.HasValue ? $" ({b.ElapsedSeconds.Value:F0}s)" : "";
-        var cmd = string.IsNullOrEmpty(b.RunningCommand) ? "(user command)" : b.RunningCommand;
+        var raw = string.IsNullOrEmpty(b.RunningCommand) ? "(user command)" : b.RunningCommand.Trim();
+        var cmd = raw.Length > 60 ? raw[..60] + "..." : raw;
         return $"⧗ {b.DisplayName}{shell} | Status: Busy{elapsed} | Pipeline: {cmd}";
     }
 
