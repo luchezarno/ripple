@@ -365,10 +365,14 @@ public class ConsoleWorker
         }
 
         // cmd.exe: set PROMPT with OSC 633 markers via /k at startup.
-        // This avoids visible injection echo in the console.
+        // The D;0 between P and A is a fake CommandFinished marker so the AI
+        // command tracker resolves. cmd has no way to expand %ERRORLEVEL% at
+        // PROMPT-display time, so the reported exit code is always 0 — a
+        // documented limitation. Without this marker, AI commands hang
+        // forever because Resolve() requires _commandEnd >= 0.
         if (shellName is "cmd")
         {
-            var prompt = "$E]633;P;Cwd=$P$E\\$E]633;A$E\\$P$G$S";
+            var prompt = "$E]633;P;Cwd=$P$E\\$E]633;D;0$E\\$E]633;A$E\\$P$G$S";
             return $"\"{_shell}\" /q /k \"prompt {prompt}\"";
         }
 
@@ -1333,6 +1337,15 @@ public class ConsoleWorker
         {
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
         }
+
+        // cmd has no preexec hook and its PROMPT only fires after the command
+        // completes, so OSC 633 C (CommandExecuted) can't mark the output start
+        // position at the right moment. Paper over the gap: the AI command's
+        // output buffer is fresh (RegisterCommand reset _aiOutput to ""), so
+        // position 0 is the true start. Without this, the tracker waits for C
+        // forever and the command hangs.
+        if (shellName is "cmd")
+            _tracker.SkipCommandStartMarker();
 
         // Multi-line commands can't be written straight to the PTY: pwsh
         // (and bash) would treat each embedded \n as "submit line now",

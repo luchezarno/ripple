@@ -170,6 +170,24 @@ public class CommandTracker
     }
 
     /// <summary>
+    /// Mark the command-start position as 0 (start of <c>_aiOutput</c>) for shells
+    /// that cannot emit OSC 633 C at the right moment. cmd.exe has no preexec hook,
+    /// so there is no way for its prompt integration to fire OSC C before the
+    /// command output begins — this method lets the worker paper over that gap so
+    /// AI commands can still resolve when cmd's PROMPT fires OSC D + OSC A.
+    ///
+    /// Safe no-op when no AI command is active or when OSC C already fired.
+    /// </summary>
+    public void SkipCommandStartMarker()
+    {
+        lock (_lock)
+        {
+            if (_isAiCommand && _commandStart < 0)
+                _commandStart = 0;
+        }
+    }
+
+    /// <summary>
     /// Fail any in-flight RegisterCommand with a "shell exited" error so the
     /// HandleExecuteAsync call blocked on it unwinds promptly. Called from
     /// the worker's read loop when the child shell process goes away.
