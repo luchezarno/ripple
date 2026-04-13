@@ -1,0 +1,216 @@
+schema: 1
+name: pwsh
+version: 1.0.0
+description: PowerShell 7+ (and Windows PowerShell 5.1 via `powershell` alias)
+homepage: https://github.com/PowerShell/PowerShell
+license: MIT
+family: shell
+
+aliases:
+  - powershell
+
+process:
+  command_template: '"{shell_path}" -NoExit -Command "{init_invocation}"'
+  inherit_environment: false
+  env:
+    POWERSHELL_TELEMETRY_OPTOUT: "1"
+  encoding: utf-8
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  kick_enter_after_ready: false
+
+init:
+  strategy: shell_integration
+  hook_type: precommand_lookup_action
+  delivery: launch_command
+  tempfile:
+    prefix: .splash-integration-
+    extension: .ps1
+  init_invocation_template: "Import-Module PSReadLine -ErrorAction SilentlyContinue; . '{tempfile_path}'; Remove-Item '{tempfile_path}' -ErrorAction SilentlyContinue"
+  script_resource: integration.ps1
+  banner_injection:
+    mode: prepend_to_tempfile
+    banner_template: |
+      Write-Host '{banner}' -ForegroundColor Green
+    reason_template: |
+      Write-Host 'Reason: {reason}' -ForegroundColor DarkYellow
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    markers:
+      prompt_start: "\x1b]633;A\x07"
+      command_input_start: "\x1b]633;B\x07"
+      command_executed: "\x1b]633;C\x07"
+      command_finished: "\x1b]633;D\x07"
+      property_update: "\x1b]633;P\x07"
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 0
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: osc_boundaries
+  line_ending: "\r\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: prompt_based
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .splash-exec-
+    extension: .ps1
+    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.ps1"
+    invocation_template: ". '{path}'; Remove-Item '{path}' -ErrorAction SilentlyContinue"
+    history_filter: '\.splash-exec-.*\.ps1'
+    cleanup_on_start: true
+    stale_ttl_hours: 24
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+  suspend: null
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "exit"
+    grace_ms: 1000
+    force_signal: kill
+  restart_on: [crash]
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  auto_modes: false
+  async_output: false
+  exit_code: true
+  cwd_tracking: true
+  job_control: false
+  shell_integration: osc633
+  user_busy_detection: osc_b
+
+probe:
+  eval: "1 + 1"
+  expect: '^2$'
+
+tests:
+  - name: simple_arithmetic
+    eval: "2 + 3"
+    expect: '^5$'
+  - name: variable_persistence
+    setup: "$x = 42"
+    eval: "$x * 2"
+    expect: '^84$'
+  - name: multiline_function
+    eval: |
+      function double { param($x) $x * 2 }
+      double 21
+    expect: '^42$'
+  - name: error_surfaces_nonzero_exit
+    eval: "Get-Item /does/not/exist"
+    expect_error: true
+  - name: cwd_change_tracked
+    setup: "Set-Location $env:TEMP"
+    eval: "$PWD.Path"
+    expect_cwd_update: true
+
+integration_script: |
+  # splash shell integration for PowerShell (pwsh.exe / powershell.exe)
+  # Injects OSC 633 escape sequences for command lifecycle tracking.
+  #
+  # Event sequence (for both AI-initiated and user-typed commands):
+  #   OSC B (Enter pressed) -> PSReadLine AcceptLine finalize ->
+  #   OSC C (command about to execute) -> command output ->
+  #   OSC D;{exitCode} (command finished) -> OSC P;Cwd=... -> OSC A (prompt ready) ->
+  #   prompt text rendered -> PSReadLine input loop (prediction, etc.)
+
+  if ($global:__SplashInjected) { return }
+  $global:__SplashInjected = $true
+
+  $global:__sp_ESC = [char]0x1B
+  $global:__sp_BEL = [char]7
+
+  function global:__sp_osc_str([string]$code) {
+      return "$($global:__sp_ESC)]633;$code$($global:__sp_BEL)"
+  }
+
+  # Override prompt function -- emits OSC D (command finished with exit code),
+  # OSC P (cwd), OSC A (prompt ready). OSC C is emitted from
+  # PreCommandLookupAction so "execution started" fires BEFORE the command
+  # writes anything.
+  $global:__sp_original_prompt = $function:prompt
+  $global:__sp_last_history_id = 0
+
+  function global:prompt {
+      $prefix = ""
+      $lastCmd = Get-History -Count 1 -ErrorAction SilentlyContinue
+      if ($lastCmd -and $lastCmd.Id -ne $global:__sp_last_history_id) {
+          $global:__sp_last_history_id = $lastCmd.Id
+          $ec = if ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 0 }
+          $prefix += (__sp_osc_str "D;$ec")
+      }
+      $prefix += (__sp_osc_str "P;Cwd=$($PWD.Path)")
+      $prefix += (__sp_osc_str "A")
+      $originalOutput = if ($global:__sp_original_prompt) {
+          & $global:__sp_original_prompt
+      } else {
+          "PS $($PWD.Path)> "
+      }
+      return $prefix + $originalOutput
+  }
+
+  # PreCommandLookupAction fires inside the engine right before command
+  # resolution -- AFTER PSReadLine AcceptLine has finalized input and BEFORE
+  # the command produces output. Emit OSC C here so splash knows that what
+  # follows is real command output, not input echo or PSReadLine rendering.
+  $global:__sp_pending_user_command = $false
+  $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
+      param($commandName, $eventArgs)
+      if ($global:__sp_pending_user_command) {
+          $global:__sp_pending_user_command = $false
+          [Console]::Write((__sp_osc_str "C"))
+      }
+  }
+
+  # Initial CommandInputStart marker via Write-Host. splash uses this to
+  # mark the shell as "ready" (first PromptStart hasn't fired yet at
+  # integration-load time, but the subsequent prompt render will).
+  Write-Host -NoNewline (__sp_osc_str "B")
+
+  # PSReadLine integrations -- best-effort. PSReadLine is normally loaded
+  # in interactive pwsh (splash's launch line also calls Import-Module on
+  # it), but screen-reader fallback or an explicit Remove-Module would
+  # leave the cmdlets undefined. Guard with Get-Module so the integration
+  # stops cleanly instead of throwing CommandNotFoundException.
+  if (Get-Module PSReadLine) {
+      try {
+          Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+              Write-Host -NoNewline (__sp_osc_str "B")
+              $global:__sp_pending_user_command = $true
+              [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+          }
+      } catch { }
+
+      # Skip the internal `. '.splash-exec-*.ps1'; Remove-Item ...` dot-
+      # source lines that splash uses to run multi-line AI commands.
+      # They're an implementation detail -- the user pressing Up wants to
+      # see the real previous commands they typed, not the transient
+      # tempfile path.
+      try {
+          Set-PSReadLineOption -AddToHistoryHandler {
+              param([string]$line)
+              if ($line -match "\.splash-exec-.*\.ps1") {
+                  return [Microsoft.PowerShell.AddToHistoryOption]::SkipAdding
+              }
+              return [Microsoft.PowerShell.AddToHistoryOption]::MemoryAndFile
+          }
+      } catch { }
+  }

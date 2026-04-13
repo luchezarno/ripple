@@ -4,8 +4,9 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using Splash.Services.Adapters;
 
-namespace SplashShell.Services;
+namespace Splash.Services;
 
 /// <summary>
 /// Console worker process: runs in --console mode.
@@ -20,7 +21,7 @@ public class ConsoleWorker
     // Worker logs go to a file, NOT to Console.Error.
     // The worker's visible console (Console.Out) is reserved for mirroring PTY output.
     // Anything to stderr would also appear there, mixed with PTY data.
-    private static readonly string LogFile = Path.Combine(Path.GetTempPath(), $"splashshell-worker-{Environment.ProcessId}.log");
+    private static readonly string LogFile = Path.Combine(Path.GetTempPath(), $"splash-worker-{Environment.ProcessId}.log");
     private static void Log(string msg) { try { File.AppendAllText(LogFile, $"{DateTime.Now:HH:mm:ss.fff} {msg}\n"); } catch { } }
 
     /// <summary>
@@ -32,7 +33,7 @@ public class ConsoleWorker
         try
         {
             var cutoff = DateTime.UtcNow.AddHours(-24);
-            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), "splashshell-worker-*.log"))
+            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), "splash-worker-*.log"))
             {
                 try
                 {
@@ -66,6 +67,14 @@ public class ConsoleWorker
     private TaskCompletionSource<string>? _claimTcs;
     private readonly string _shell;
     private readonly string _cwd;
+    /// <summary>
+    /// Adapter for the shell this worker is hosting, looked up from
+    /// AdapterRegistry.Default during construction. Null when no YAML
+    /// adapter matches the shell name — in that case the worker falls back
+    /// to the original hardcoded shell-family branches. Phase B milestones
+    /// progressively replace those branches with adapter-driven reads.
+    /// </summary>
+    private readonly Adapter? _adapter;
     private IPtySession? _pty;
     private Stream? _writer;
     private readonly OscParser _parser = new();
@@ -113,6 +122,15 @@ public class ConsoleWorker
         _banner = banner;
         _reason = reason;
         _unownedPipeName = $"{ConsoleManager.PipePrefix}.{Environment.ProcessId}";
+
+        // Adapter shadow lookup (phase B, Milestone 2a). Normalize the
+        // shell path to a family name and look it up in the registry.
+        // Null result means we fall through to the hardcoded paths.
+        var shellFamily = ConsoleManager.NormalizeShellFamily(shell);
+        _adapter = AdapterRegistry.Default?.Find(shellFamily);
+        Log(_adapter != null
+            ? $"Adapter matched: name={_adapter.Name} family={_adapter.Family} version={_adapter.Version}"
+            : $"No adapter matched for shell family '{shellFamily}' — using hardcoded fallback");
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -147,7 +165,11 @@ public class ConsoleWorker
         // MSYS2/Git Bash needs the parent's environment (MSYSTEM, HOME, PATH with Git paths).
         // pwsh uses a clean environment to avoid inheriting MCP server variables.
         var shellName = ConsoleManager.NormalizeShellFamily(_shell);
-        bool inheritEnv = !ConsoleManager.IsPowerShellFamily(shellName);
+        // Milestone 2b: inherit_environment comes from the adapter when
+        // one is loaded for this shell, else falls back to the hardcoded
+        // "pwsh family = clean env, everyone else = inherit" rule.
+        bool inheritEnv = _adapter?.Process.InheritEnvironment
+            ?? !ConsoleManager.IsPowerShellFamily(shellName);
         int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         _pty = PtyFactory.Start(commandLine, _cwd, cols, rows, inheritEnvironment: inheritEnv);
@@ -165,7 +187,12 @@ public class ConsoleWorker
         // loop via _shellExitedTcs so the worker can tear itself down.
         _ = WaitForShellExitAsync(ct);
 
-        var enter = ConsoleManager.EnterKeyFor(shellName);
+        // Milestone 2c: PTY line-ending sequence for submitting input.
+        // Comes from the adapter's input.line_ending when loaded (pwsh/cmd
+        // = "\r", bash/zsh = "\n"), else falls back to the hardcoded
+        // family-based rule.
+        var enter = _adapter?.Input.LineEnding
+            ?? ConsoleManager.EnterKeyFor(shellName);
 
         if (ConsoleManager.IsPowerShellFamily(shellName))
         {
@@ -368,7 +395,7 @@ public class ConsoleWorker
                     prefix.AppendLine($"Write-Host 'Reason: {_reason.Replace("'", "''")}' -ForegroundColor DarkYellow");
                 if (prefix.Length > 0) prefix.AppendLine("Write-Host");
 
-                var tmpFile = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1");
+                var tmpFile = Path.Combine(Path.GetTempPath(), $".splash-integration-{Environment.ProcessId}.ps1");
                 File.WriteAllText(tmpFile, prefix.ToString() + script);
                 // -NoExit keeps the shell alive after -Command completes.
                 // The command imports PSReadLine + sources the integration script silently.
@@ -454,7 +481,7 @@ public class ConsoleWorker
             // Windows temp path directly since the worker and child share
             // the filesystem, then teach the shell how to find it in its
             // own namespace (/mnt/c/... for WSL, /c/... for MSYS2).
-            var windowsPath = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.sh");
+            var windowsPath = Path.Combine(Path.GetTempPath(), $".splash-integration-{Environment.ProcessId}.sh");
             var scriptContent = script.Replace("\r\n", "\n");
             await File.WriteAllTextAsync(windowsPath, scriptContent, ct);
 
@@ -470,11 +497,11 @@ public class ConsoleWorker
         {
             // Linux/macOS: heredoc the script into the child's own /tmp so
             // we don't need the worker to see the child's filesystem.
-            var tmpFile = $"/tmp/.splashshell-integration-{Environment.ProcessId}.sh";
+            var tmpFile = $"/tmp/.splash-integration-{Environment.ProcessId}.sh";
             var injection = new StringBuilder();
-            injection.AppendLine($"cat > {tmpFile} << 'SPLASHSHELL_EOF'");
+            injection.AppendLine($"cat > {tmpFile} << 'SPLASH_EOF'");
             injection.AppendLine(script.TrimEnd());
-            injection.AppendLine("SPLASHSHELL_EOF");
+            injection.AppendLine("SPLASH_EOF");
             injection.AppendLine($"source {tmpFile}; rm -f {tmpFile}");
             await WriteToPty(injection.ToString(), ct);
         }
@@ -651,7 +678,7 @@ public class ConsoleWorker
     private static string? LoadEmbeddedScript(string name)
     {
         var assembly = Assembly.GetExecutingAssembly();
-        var resourceName = $"SplashShell.ShellIntegration.{name}";
+        var resourceName = $"Splash.ShellIntegration.{name}";
         using var stream = assembly.GetManifestResourceStream(resourceName);
         if (stream == null) return null;
         using var reader = new StreamReader(stream);
@@ -1492,7 +1519,8 @@ public class ConsoleWorker
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
 
         var shellName = ConsoleManager.NormalizeShellFamily(_shell);
-        var enter = ConsoleManager.EnterKeyFor(shellName);
+        var enter = _adapter?.Input.LineEnding
+            ?? ConsoleManager.EnterKeyFor(shellName);
 
         // Multi-line pwsh commands have their echo emitted from inside the
         // tempfile itself via [Console]::Write so the child's virtual
@@ -1871,7 +1899,8 @@ public class ConsoleWorker
         WriteBannerText(banner, reason);
 
         // Kick the shell to draw a fresh prompt after the banner
-        var enter = ConsoleManager.EnterKeyFor(ConsoleManager.NormalizeShellFamily(_shell));
+        var enter = _adapter?.Input.LineEnding
+            ?? ConsoleManager.EnterKeyFor(ConsoleManager.NormalizeShellFamily(_shell));
         try
         {
             var bytes = Encoding.UTF8.GetBytes(enter);
@@ -1911,7 +1940,7 @@ public class ConsoleWorker
             // Show a prominent banner so the human user understands what happened:
             // AI/MCP control has been detached, but the shell itself is still usable.
             WriteBannerText(
-                $"This console is no longer managed by splashshell (worker v{_myVersion.ToString(3)}).",
+                $"This console is no longer managed by splash (worker v{_myVersion.ToString(3)}).",
                 $"A newer proxy (v{proxyVer}) tried to re-claim this console. The shell is still available for you to use directly, but AI commands via MCP will no longer route here. Close the window when you're done.",
                 isReuse: true);
             Log($"Claim refused: proxy v{proxyVer} > worker v{_myVersion}. Marking obsolete.");

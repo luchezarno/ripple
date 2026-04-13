@@ -7,14 +7,14 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>splash</AssemblyName>
-    <RootNamespace>SplashShell</RootNamespace>
+    <RootNamespace>Splash</RootNamespace>
     <Version>0.5.0</Version>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
     <Authors>Yoshifumi Tsuda</Authors>
     <Company>Yoshifumi Tsuda</Company>
-    <Product>SplashShell</Product>
+    <Product>Splash</Product>
     <Description>Universal MCP server that exposes any shell (bash, pwsh, cmd) over ConPTY</Description>
     <Copyright>Copyright (c) 2026 Yoshifumi Tsuda</Copyright>
   </PropertyGroup>
@@ -23,12 +23,21 @@
     <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.5" />
     <PackageReference Include="Microsoft.DotNet.ILCompiler" Version="9.0.14" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <PackageReference Include="Vecc.YamlDotNet.Analyzers.StaticGenerator" Version="16.3.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
   </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="ShellIntegration\integration.bash" />
     <EmbeddedResource Include="ShellIntegration\integration.ps1" />
     <EmbeddedResource Include="ShellIntegration\integration.zsh" />
+    <EmbeddedResource Include="adapters\pwsh.yaml" />
+    <EmbeddedResource Include="adapters\bash.yaml" />
+    <EmbeddedResource Include="adapters\zsh.yaml" />
+    <EmbeddedResource Include="adapters\cmd.yaml" />
   </ItemGroup>
 
 </Project>

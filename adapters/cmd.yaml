@@ -1,0 +1,115 @@
+schema: 1
+name: cmd
+version: 1.0.0
+description: Windows Command Processor (cmd.exe)
+homepage: https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd
+license: proprietary
+family: shell
+
+process:
+  # cmd has no preexec hook and no way to expand %ERRORLEVEL% at PROMPT
+  # display time, so integration is delivered entirely via the PROMPT
+  # variable expansion: P (cwd) -> D;0 (fake finished, always 0) -> A
+  # (prompt ready). OSC C cannot be emitted at the right moment, so the
+  # runtime must use deterministic input-echo stripping instead of OSC
+  # boundaries, and the user-busy detector falls back to CPU + child
+  # process polling.
+  command_template: '"{shell_path}" /q /k "prompt {prompt_template}"'
+  prompt_template: "$E]633;P;Cwd=$P$E\\$E]633;D;0$E\\$E]633;A$E\\$P$G$S"
+  inherit_environment: true
+  env: {}
+  encoding: utf-8
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 2000
+  kick_enter_after_ready: true
+
+init:
+  strategy: prompt_variable
+  hook_type: none
+  delivery: launch_command
+  # No separate script file -- the integration is the prompt_template above
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 400
+  strip_ansi: false
+  strip_input_echo: true
+  # cmd has no OSC C marker (no preexec hook), so we cannot use OSC
+  # boundaries to know where input echo ends. Instead the runtime walks
+  # the output forwards matching the exact bytes it wrote (skipping
+  # CR/LF inserted by ConPTY's line-wrap), then drops trailing newline.
+  input_echo_strategy: deterministic_byte_match
+
+input:
+  line_ending: "\r"
+  multiline_detect: none
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .splash-exec-
+    extension: .cmd
+    invocation_template: 'call "{path}" & del "{path}"'
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+  suspend: null
+
+lifecycle:
+  shutdown:
+    command: "exit"
+    grace_ms: 1000
+    force_signal: kill
+  restart_on: [crash]
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  auto_modes: false
+  async_output: false
+  exit_code: unreliable      # always reported as 0 -- cmd limitation
+  cwd_tracking: true
+  job_control: false
+  shell_integration: osc633
+  user_busy_detection: process_polling
+  # The runtime polls the cmd process CPU time + child process count
+  # every 500 ms. CPU delta > 50 ms OR any direct child -> busy.
+  user_busy_detection_params:
+    poll_interval_ms: 500
+    cpu_busy_threshold_ms: 50
+    include_children: true
+
+probe:
+  eval: "echo 2"
+  expect: '^2$'
+
+tests:
+  - name: echo_literal
+    eval: "echo hello"
+    expect: '^hello$'
+  - name: cwd_change_tracked
+    setup: "cd %TEMP%"
+    eval: "cd"
+    expect_cwd_update: true
+  - name: exit_code_always_zero
+    # Document the limitation explicitly in the contract tests so any
+    # future "exit code fix" is forced to confront it. cmd cannot report
+    # real exit codes without external cooperation (a DOSKEY macro or
+    # wrapper script would break PROMPT-based integration).
+    eval: "dir /does/not/exist 2>nul"
+    expect_exit_code: 0
+    exit_code_is_unreliable: true
+
+# No integration_script -- cmd's PROMPT variable carries the entire
+# integration via the prompt_template above. This is the only family
+# currently in the schema that uses strategy: prompt_variable.

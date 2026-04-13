@@ -1,0 +1,138 @@
+schema: 1
+name: zsh
+version: 1.0.0
+description: Z Shell
+homepage: https://www.zsh.org/
+license: MIT
+family: shell
+
+process:
+  command_template: '"{shell_path}" -l -i'
+  inherit_environment: true
+  env: {}
+  encoding: utf-8
+  line_ending: "\n"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 2000
+  suppress_mirror_during_inject: true
+  kick_enter_after_ready: true
+  delay_after_inject_ms: 500
+
+init:
+  strategy: shell_integration
+  hook_type: preexec
+  delivery: pty_inject
+  inject:
+    method: source_file
+    windows:
+      tempfile_prefix: .splash-integration-
+      tempfile_extension: .sh
+      wsl_path_template: "/mnt/{drive_lower}{path_unix}"
+      msys_path_template: "/{drive_lower}{path_unix}"
+      source_command_template: "source '{unix_path}'; rm -f '{unix_path}'\n"
+    unix:
+      tempfile_path_template: "/tmp/.splash-integration-{pid}.sh"
+      source_command_template: |
+        cat > {tempfile_path} << 'SPLASH_EOF'
+        {script_body}
+        SPLASH_EOF
+        source {tempfile_path}; rm -f {tempfile_path}
+  script_resource: integration.zsh
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: osc_boundaries
+  line_ending: "\n"
+
+input:
+  line_ending: "\n"
+  multiline_detect: prompt_based
+  multiline_delivery: direct
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+  suspend: "\x1a"
+
+lifecycle:
+  shutdown:
+    command: "exit"
+    grace_ms: 1000
+    force_signal: kill
+  restart_on: [crash]
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  auto_modes: false
+  async_output: false
+  exit_code: true
+  cwd_tracking: true
+  job_control: true
+  shell_integration: osc633
+  user_busy_detection: osc_b
+
+probe:
+  eval: "echo $((1 + 1))"
+  expect: '^2$'
+
+tests:
+  - name: simple_arithmetic
+    eval: "echo $((2 + 3))"
+    expect: '^5$'
+  - name: variable_persistence
+    setup: "x=42"
+    eval: "echo $((x * 2))"
+    expect: '^84$'
+  - name: cwd_change_tracked
+    setup: "cd /tmp"
+    eval: "pwd"
+    expect_cwd_update: true
+  - name: exit_code_propagates
+    eval: "false"
+    expect_exit_code: 1
+
+integration_script: |
+  # splash shell integration for zsh
+  # Injects OSC 633 escape sequences for command lifecycle tracking.
+
+  if [[ "$__SPLASH_INJECTED" == "1" ]]; then
+      return
+  fi
+  __SPLASH_INJECTED=1
+
+  __sp_osc() {
+      printf '\e]633;%s\a' "$1"
+  }
+
+  # precmd hook: runs before each prompt
+  __sp_precmd() {
+      local exit_code=$?
+      __sp_osc "D;$exit_code"
+      __sp_osc "P;Cwd=$(pwd)"
+      __sp_osc "A"
+  }
+
+  # preexec hook: runs before command execution
+  __sp_preexec() {
+      __sp_osc "C"
+  }
+
+  autoload -Uz add-zsh-hook
+  add-zsh-hook precmd __sp_precmd
+  add-zsh-hook preexec __sp_preexec
+
+  __sp_osc "B"
