@@ -56,6 +56,14 @@ public static class AdapterLoader
     /// Load all adapter YAMLs embedded in this assembly. Returns the list
     /// of successfully parsed adapters and a list of (resourceName, error)
     /// pairs for any that failed.
+    ///
+    /// After parsing, resolves adapter.IntegrationScript: if the YAML did
+    /// not provide an inline `integration_script:` block, falls back to
+    /// loading the embedded resource named by `init.script_resource`
+    /// (e.g. "integration.ps1" -> Splash.ShellIntegration.integration.ps1).
+    /// This keeps ShellIntegration/*.{ps1,bash,zsh} as the single source
+    /// of truth for shell integration scripts and lets adapters reference
+    /// them by name without duplicating their content.
     /// </summary>
     public static LoadResult LoadEmbedded()
     {
@@ -77,6 +85,7 @@ public static class AdapterLoader
                 using var reader = new StreamReader(stream);
                 var yaml = reader.ReadToEnd();
                 var adapter = Parse(yaml, resourceName);
+                ResolveIntegrationScript(adapter, assembly);
                 adapters.Add(adapter);
             }
             catch (Exception ex)
@@ -86,6 +95,31 @@ public static class AdapterLoader
         }
 
         return new LoadResult(adapters, errors);
+    }
+
+    /// <summary>
+    /// Populate adapter.IntegrationScript from an embedded resource named
+    /// by adapter.Init.ScriptResource, unless the YAML already provided
+    /// an inline integration_script block. No-op when neither is set.
+    /// Throws InvalidOperationException if script_resource is set but
+    /// the embedded resource is not found.
+    /// </summary>
+    private static void ResolveIntegrationScript(Adapter adapter, Assembly assembly)
+    {
+        if (!string.IsNullOrEmpty(adapter.IntegrationScript))
+            return;
+
+        var resourceRef = adapter.Init.ScriptResource;
+        if (string.IsNullOrEmpty(resourceRef))
+            return;
+
+        var fullResourceName = $"Splash.ShellIntegration.{resourceRef}";
+        using var stream = assembly.GetManifestResourceStream(fullResourceName)
+            ?? throw new InvalidOperationException(
+                $"Adapter '{adapter.Name}' references script_resource '{resourceRef}' " +
+                $"but embedded resource '{fullResourceName}' was not found.");
+        using var reader = new StreamReader(stream);
+        adapter.IntegrationScript = reader.ReadToEnd();
     }
 
     public record LoadResult(

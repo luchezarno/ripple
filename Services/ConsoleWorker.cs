@@ -377,7 +377,12 @@ public class ConsoleWorker
 
         if (ConsoleManager.IsPowerShellFamily(shellName))
         {
-            var script = LoadEmbeddedScript("integration.ps1");
+            // Milestone 2d: integration script comes from the adapter when
+            // loaded (YAML's script_resource is resolved to the embedded
+            // resource at startup), else fall back to the direct embedded
+            // resource read for unknown shell families.
+            var script = _adapter?.IntegrationScript
+                ?? LoadEmbeddedScript("integration.ps1");
             if (script != null)
             {
                 // Prepend Write-Host banner/reason lines so they're emitted by
@@ -463,11 +468,15 @@ public class ConsoleWorker
         // its PROMPT at /k startup. So the old dead pwsh branch here used
         // to never fire — it's gone now.
         var shellName = ConsoleManager.NormalizeShellFamily(_shell);
-        string? script = shellName switch
-        {
-            "zsh" => LoadEmbeddedScript("integration.zsh"),
-            _    => LoadEmbeddedScript("integration.bash"),
-        };
+        // Milestone 2d: prefer adapter's IntegrationScript (resolved from
+        // YAML's script_resource at load time), fall back to the old
+        // shell-family dispatch for shells without an adapter.
+        string? script = _adapter?.IntegrationScript
+            ?? shellName switch
+            {
+                "zsh" => LoadEmbeddedScript("integration.zsh"),
+                _    => LoadEmbeddedScript("integration.bash"),
+            };
 
         if (script == null)
         {
