@@ -275,8 +275,13 @@ public class ConsoleWorker
         // CPU > 0 → cmd is running an internal builtin, child present → cmd
         // launched an external command. Either signal flips the tracker to
         // busy so execute_command auto-routes around the user.
+        //
+        // Milestone 2h: gated on adapter.capabilities.user_busy_detection
+        // (falls back to the old shellName == "cmd" check for unknown shells).
         Task? userBusyTask = null;
-        if (OperatingSystem.IsWindows() && shellName == "cmd")
+        var userBusyMethod = _adapter?.Capabilities.UserBusyDetection
+            ?? (shellName == "cmd" ? "process_polling" : null);
+        if (OperatingSystem.IsWindows() && userBusyMethod == "process_polling")
             userBusyTask = UserBusyDetectorLoop(ct);
 
         // Run owned + unowned pipe servers. Two owned listeners share the
@@ -600,8 +605,15 @@ public class ConsoleWorker
     /// </summary>
     private async Task UserBusyDetectorLoop(CancellationToken ct)
     {
-        const int PollIntervalMs = 500;
-        var cpuBusyThreshold = TimeSpan.FromMilliseconds(50);
+        // Milestone 2h: tuning params come from
+        // adapter.capabilities.user_busy_detection_params when available,
+        // else fall back to the values cmd.yaml documents (500ms / 50ms /
+        // children=true).
+        var tuning = _adapter?.Capabilities.UserBusyDetectionParams;
+        int pollIntervalMs = tuning?.PollIntervalMs > 0 ? tuning.PollIntervalMs : 500;
+        var cpuBusyThreshold = TimeSpan.FromMilliseconds(
+            tuning?.CpuBusyThresholdMs > 0 ? tuning.CpuBusyThresholdMs : 50);
+        bool includeChildren = tuning?.IncludeChildren ?? true;
 
         Process? proc;
         try { proc = Process.GetProcessById(_pty!.ProcessId); }
@@ -614,7 +626,7 @@ public class ConsoleWorker
         {
             while (!ct.IsCancellationRequested)
             {
-                try { await Task.Delay(PollIntervalMs, ct); }
+                try { await Task.Delay(pollIntervalMs, ct); }
                 catch (OperationCanceledException) { break; }
 
                 try
@@ -632,7 +644,7 @@ public class ConsoleWorker
                     lastCpuTicks = currentTicks;
                     firstSample = false;
 
-                    bool hasChild = HasChildProcess(_pty.ProcessId);
+                    bool hasChild = includeChildren && HasChildProcess(_pty.ProcessId);
                     _tracker.SetUserBusyHint(cpuBusy || hasChild);
                 }
                 catch (Exception ex)
