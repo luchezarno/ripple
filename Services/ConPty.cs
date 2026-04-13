@@ -170,7 +170,57 @@ public static class ConPty
     /// Create a ConPTY pseudoconsole and launch a process attached to it.
     /// Uses Named Pipes following node-pty's architecture.
     /// </summary>
-    public static ConPtySession Start(string commandLine, string? workingDirectory = null, int cols = 120, int rows = 30, bool inheritEnvironment = false)
+    /// <summary>
+    /// Serializes ConPty launches when adapter env overrides are in play.
+    /// Env overrides for inherit_environment=true are applied by
+    /// temporarily SetEnvironmentVariable-ing the parent process, which
+    /// is racy across concurrent launches. The rare cost (console
+    /// creation happens once per shell, not per command) easily pays
+    /// for the simplicity of not building a manual env block.
+    /// </summary>
+    private static readonly object _envOverrideLock = new();
+
+    public static ConPtySession Start(
+        string commandLine,
+        string? workingDirectory = null,
+        int cols = 120,
+        int rows = 30,
+        bool inheritEnvironment = false,
+        IReadOnlyDictionary<string, string>? envOverrides = null)
+    {
+        // Callers may declare adapter.process.env in YAML. For the
+        // inherit_environment=true path (python, bash/zsh) we serialise
+        // launches under _envOverrideLock and mutate the parent's env
+        // briefly so CreateProcessW(envBlock=NULL) picks the overrides
+        // up. For inherit_environment=false (pwsh) we would need to
+        // parse/rebuild the CreateEnvironmentBlock output — TODO when
+        // an actual clean-env adapter needs overrides.
+        if (envOverrides != null && envOverrides.Count > 0 && inheritEnvironment)
+        {
+            lock (_envOverrideLock)
+            {
+                var backup = new Dictionary<string, string?>(envOverrides.Count);
+                foreach (var kv in envOverrides)
+                {
+                    backup[kv.Key] = Environment.GetEnvironmentVariable(kv.Key);
+                    Environment.SetEnvironmentVariable(kv.Key, kv.Value);
+                }
+                try
+                {
+                    return StartImpl(commandLine, workingDirectory, cols, rows, inheritEnvironment);
+                }
+                finally
+                {
+                    foreach (var kv in backup)
+                        Environment.SetEnvironmentVariable(kv.Key, kv.Value);
+                }
+            }
+        }
+
+        return StartImpl(commandLine, workingDirectory, cols, rows, inheritEnvironment);
+    }
+
+    private static ConPtySession StartImpl(string commandLine, string? workingDirectory, int cols, int rows, bool inheritEnvironment)
     {
         var pipeName = $@"\\.\pipe\splash-{Environment.ProcessId}-{Guid.NewGuid():N}";
 

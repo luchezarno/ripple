@@ -17,11 +17,17 @@ public interface IPtySession : IDisposable
 /// </summary>
 public static class PtyFactory
 {
-    public static IPtySession Start(string commandLine, string? workingDirectory = null, int cols = 120, int rows = 30, bool inheritEnvironment = false)
+    public static IPtySession Start(
+        string commandLine,
+        string? workingDirectory = null,
+        int cols = 120,
+        int rows = 30,
+        bool inheritEnvironment = false,
+        IReadOnlyDictionary<string, string>? envOverrides = null)
     {
         if (OperatingSystem.IsWindows())
-            return ConPty.Start(commandLine, workingDirectory, cols, rows, inheritEnvironment);
+            return ConPty.Start(commandLine, workingDirectory, cols, rows, inheritEnvironment, envOverrides);
 
-        return UnixPty.Start(commandLine, workingDirectory, cols, rows);
+        return UnixPty.Start(commandLine, workingDirectory, cols, rows, envOverrides);
     }
 }

@@ -1,0 +1,155 @@
+schema: 1
+name: python
+version: 0.1.0
+description: >
+  CPython 3 interactive REPL with OSC 633 shell-integration-style command
+  tracking. Emits OSC D / P / A from a sys.ps1 subclass whose __str__ is
+  re-evaluated by Python on every prompt render, which gives splash the
+  same command-boundary observability it has for pwsh/bash/zsh without
+  needing the regex-based escape hatch.
+homepage: https://github.com/yotsuda/splash
+license: MIT
+family: repl
+aliases:
+  - python3
+  - py
+
+process:
+  # `python -i {startup.py}` runs the startup script as __main__ and then
+  # drops into interactive mode, so our sys.ps1 replacement stays live.
+  # The tempfile path is substituted via the same {init_invocation}
+  # placeholder pwsh uses for its -Command string.
+  command_template: '"{shell_path}" -i {init_invocation}'
+  inherit_environment: true
+  env:
+    # Python 3.13 introduced pyrepl, a readline-style interactive editor
+    # that re-renders the prompt on every keystroke and calls
+    # str(sys.ps1) many times per input character. Both behaviors
+    # conflict with splash's OSC-based tracker (OSC D would fire
+    # per-keystroke with meaningless positions, and deterministic input
+    # echo stripping can't match re-rendered prompts). Force the old
+    # basic REPL so sys.ps1 is evaluated exactly once per command
+    # boundary, which is what our integration.py relies on.
+    PYTHON_BASIC_REPL: "1"
+    # Line-buffered stdout so command output is flushed before the next
+    # prompt renders (and before splash's OSC A fires on it). Without
+    # this, `print("x")` followed immediately by the next prompt can
+    # race the tracker.
+    PYTHONUNBUFFERED: "1"
+  encoding: utf-8
+  # CPython's interactive reader on Windows treats \r as "Enter pressed"
+  # and plain \n as a line separator that doesn't submit the line. Bash
+  # and other POSIX shells running under ConPTY accept \n, but Python
+  # does not — so Python needs the CR terminator even though it's a
+  # Unix-origin interpreter.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  # Python starts fast enough that we don't need to settle before
+  # anything; the first OSC A arrives within ~200ms of launch.
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 0
+
+init:
+  strategy: shell_integration
+  hook_type: prompt_variable        # sys.ps1 replacement
+  delivery: launch_command
+  tempfile:
+    prefix: .splash-integration-
+    extension: .py
+  # {tempfile_path} gets substituted at runtime — just the absolute path,
+  # no quoting dance because the command_template already wraps it.
+  init_invocation_template: '"{tempfile_path}"'
+  script_resource: integration.py
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    markers:
+      prompt_start: "A"
+      command_finished: "D"
+      property_update: "P"
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  # sys.displayhook flushes synchronously, so output is already settled
+  # by the time OSC A fires. A small window keeps compound statements
+  # like `import x; x.foo()` from racing the tracker.
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  # Python echoes input through the PTY and there's no OSC B to mark
+  # where the echo ends, so we strip it deterministically the same way
+  # cmd.exe does (walk the capture head, match sent bytes, skip CR/LF
+  # inserted by ConPTY line wrap).
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  # Python is indent-sensitive, so counting brackets alone can't decide
+  # when a multi-line block is complete. For now, rely on the caller
+  # (splash execute_command) to hand us already-complete blocks and
+  # submit them line by line. multiline delivery via tempfile comes in
+  # a follow-up once we have exec(open(...).read()) wrapping plumbed.
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "exit()"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  async_output: false
+  # Python REPL has no per-expression exit code; tracebacks print to
+  # stderr but the prompt still returns, so we report 0 for every
+  # command and document exit_code as unreliable.
+  exit_code: "unreliable"
+  cwd_tracking: true
+  job_control: false
+  shell_integration: osc633
+  # Python's stdlib has no stable pre-input hook, so we can't emit OSC B
+  # when a human starts typing. Leave user-busy detection off — the AI
+  # tracker still works because splash controls send_input directly.
+  user_busy_detection: none
+
+probe:
+  eval: "1 + 1"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic returns a value"
+    eval: "21 * 2"
+    expect: '42'
+
+  - name: "stateful: variable persists across commands"
+    setup_sequence:
+      - eval: "SPLASH_TEST = 'persist-ok'"
+    eval: "SPLASH_TEST"
+    expect: 'persist-ok'
+
+  - name: "cwd tracking: os.chdir reports via OSC P"
+    setup: "import os; os.chdir(os.path.dirname(os.getcwd()))"
+    expect_cwd_update: true
+
+  - name: "exception: traceback printed, prompt still returns"
+    eval: "raise ValueError('boom')"
+    expect: 'ValueError: boom'
+    exit_code_is_unreliable: true

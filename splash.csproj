@@ -34,10 +34,12 @@
     <EmbeddedResource Include="ShellIntegration\integration.bash" />
     <EmbeddedResource Include="ShellIntegration\integration.ps1" />
     <EmbeddedResource Include="ShellIntegration\integration.zsh" />
+    <EmbeddedResource Include="ShellIntegration\integration.py" />
     <EmbeddedResource Include="adapters\pwsh.yaml" />
     <EmbeddedResource Include="adapters\bash.yaml" />
     <EmbeddedResource Include="adapters\zsh.yaml" />
     <EmbeddedResource Include="adapters\cmd.yaml" />
+    <EmbeddedResource Include="adapters\python.yaml" />
   </ItemGroup>
 
 </Project>

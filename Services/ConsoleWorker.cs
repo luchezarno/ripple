@@ -194,7 +194,10 @@ public class ConsoleWorker
             ?? !_isPwshFamily;
         int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
-        _pty = PtyFactory.Start(commandLine, _cwd, cols, rows, inheritEnvironment: inheritEnv);
+        var envOverrides = _adapter?.Process.Env;
+        _pty = PtyFactory.Start(commandLine, _cwd, cols, rows,
+            inheritEnvironment: inheritEnv,
+            envOverrides: envOverrides);
         _tracker.SetTerminalSize(cols, rows);
         _writer = _pty.InputStream;
 
@@ -469,6 +472,42 @@ public class ConsoleWorker
                     ("shell_path", _shell),
                     ("init_invocation", initInvocation));
             }
+        }
+
+        // Phase C: REPL-style adapters whose integration lives in a
+        // tempfile the interpreter sources at startup (Python's `-i
+        // script.py`, and in principle any future REPL with a similar
+        // launch convention). Same shape as the pwsh branch above but
+        // without banner_injection — the worker's pre-PTY WriteBanner
+        // handles banner/reason rendering for non-pwsh adapters, so
+        // the tempfile body stays pure integration code.
+        //
+        // The script body may itself reference {tempfile_path} (e.g. to
+        // hardcode the absolute path for self-deletion), so substitute
+        // it once before writing the file. Guarded on launch_command +
+        // script_resource + non-pwsh + non-cmd so pwsh and cmd keep
+        // their existing branches.
+        if (!_isPwshFamily && shellName != "cmd" &&
+            _adapter is { Init: { Delivery: "launch_command", ScriptResource: not null } } replAdapter &&
+            replAdapter.IntegrationScript is { } replScript &&
+            !string.IsNullOrEmpty(replAdapter.Process.CommandTemplate))
+        {
+            var tmpPrefix = replAdapter.Init.Tempfile?.Prefix ?? ".splash-integration-";
+            var tmpExt = replAdapter.Init.Tempfile?.Extension ?? "";
+            var tmpFile = Path.Combine(
+                Path.GetTempPath(),
+                $"{tmpPrefix}{Environment.ProcessId}{tmpExt}");
+
+            File.WriteAllText(tmpFile, replScript.Replace("{tempfile_path}", tmpFile));
+
+            var initInvocationTpl = replAdapter.Init.InitInvocationTemplate
+                ?? "\"{tempfile_path}\"";
+            var initInvocation = ExpandTemplate(initInvocationTpl,
+                ("tempfile_path", tmpFile));
+
+            return ExpandTemplate(replAdapter.Process.CommandTemplate,
+                ("shell_path", _shell),
+                ("init_invocation", initInvocation));
         }
 
         // cmd.exe: set PROMPT with OSC 633 markers via /k at startup.
@@ -1656,13 +1695,14 @@ public class ConsoleWorker
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
         }
 
-        // cmd has no preexec hook and its PROMPT only fires after the command
-        // completes, so OSC 633 C (CommandExecuted) can't mark the output start
-        // position at the right moment. Paper over the gap: the AI command's
-        // output buffer is fresh (RegisterCommand reset _aiOutput to ""), so
-        // position 0 is the true start. Without this, the tracker waits for C
-        // forever and the command hangs.
-        if (shellName is "cmd")
+        // Adapters whose input echo strategy is deterministic_byte_match
+        // (cmd, python, any REPL without a stdlib pre-input hook that can
+        // emit OSC B/C) have no way to fire OSC C at the moment the
+        // command starts, so the tracker would wait forever for a marker
+        // that never arrives. Paper over the gap: RegisterCommand has
+        // just reset _aiOutput to "", so position 0 is the true start
+        // of the command's captured window.
+        if (_adapter?.Output.InputEchoStrategy == "deterministic_byte_match")
             _tracker.SkipCommandStartMarker();
 
         // Multi-line commands can't be written straight to the PTY: pwsh
@@ -1756,15 +1796,17 @@ public class ConsoleWorker
         {
             var result = await resultTask;
             var cleanedOutput = result.Output;
-            if (shellName is "cmd")
+            if (_adapter?.Output.InputEchoStrategy == "deterministic_byte_match")
             {
-                // cmd has no preexec hook, so the OSC C marker can't separate
-                // the ConPTY input echo from the command output the way pwsh /
-                // bash do. Strip the echoed input bytes from the head of the
-                // captured slice instead — that's the exact bytes we wrote to
-                // the PTY (single-line: the literal command; multi-line: the
-                // `call "tmp" & del "tmp"` wrapper). enter is dropped because
-                // it's the line submission and never appears in the echo.
+                // Shells/REPLs that can't fire OSC C (cmd, python, any
+                // interpreter without a stdlib pre-input hook) have no
+                // marker separating ConPTY's input echo from the command
+                // output. Strip the echoed input bytes from the head of
+                // the captured slice instead — the exact bytes we wrote
+                // to the PTY (single-line: the literal command;
+                // multi-line on cmd: the `call "tmp" & del "tmp"`
+                // wrapper). enter is dropped because it's the line
+                // submission and never appears in the echo.
                 var echoExpected = ptyPayload;
                 if (echoExpected.EndsWith(enter))
                     echoExpected = echoExpected[..^enter.Length];

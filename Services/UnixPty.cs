@@ -175,7 +175,7 @@ public static class UnixPty
     /// <summary>
     /// Create a Unix PTY and fork/exec a process.
     /// </summary>
-    public static UnixPtySession Start(string commandLine, string? workingDirectory = null, int cols = 120, int rows = 30)
+    public static UnixPtySession Start(string commandLine, string? workingDirectory = null, int cols = 120, int rows = 30, IReadOnlyDictionary<string, string>? envOverrides = null)
     {
         // Open master PTY
         int masterFd = posix_openpt(O_RDWR | O_NOCTTY);
