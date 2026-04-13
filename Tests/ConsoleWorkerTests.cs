@@ -38,6 +38,27 @@ public class ConsoleWorkerTests
         Assert(ConsoleWorker.UnescapeInput("\\r").Length == 1, "unescape: \\r length is 1");
         Assert(ConsoleWorker.UnescapeInput("\\x03").Length == 1, "unescape: \\x03 length is 1");
 
+        // StripCmdInputEcho — strips ConPTY's input-echo prefix from cmd output.
+        Assert(ConsoleWorker.StripCmdInputEcho("echo hello\r\nhello\r\n", "echo hello") == "hello\r\n",
+            "strip cmd echo: simple single-line");
+        Assert(ConsoleWorker.StripCmdInputEcho("echo hello\nhello\n", "echo hello") == "hello\n",
+            "strip cmd echo: LF-only newlines");
+        Assert(ConsoleWorker.StripCmdInputEcho("set\nVAR1=a\nVAR2=b\n", "set") == "VAR1=a\nVAR2=b\n",
+            "strip cmd echo: command with empty args");
+        Assert(ConsoleWorker.StripCmdInputEcho("echo hello world\n hello world\n", "echo hello world") == " hello world\n",
+            "strip cmd echo: only first matching prefix is consumed");
+        // Line wrap: ConPTY inserts \n mid-echo when the typed command exceeds terminal width.
+        Assert(ConsoleWorker.StripCmdInputEcho("dir /b *.cs\n*.csproj\nProgram.cs\n", "dir /b *.cs") == "*.csproj\nProgram.cs\n",
+            "strip cmd echo: trailing newline after echo is dropped");
+        Assert(ConsoleWorker.StripCmdInputEcho("echo abc def\nghi\n", "echo abc defghi") == "",
+            "strip cmd echo: wrap-fold absorbs entire output");
+        Assert(ConsoleWorker.StripCmdInputEcho("real output", "echo no match") == "real output",
+            "strip cmd echo: mismatch returns original output");
+        Assert(ConsoleWorker.StripCmdInputEcho("", "echo something") == "",
+            "strip cmd echo: empty output returns empty");
+        Assert(ConsoleWorker.StripCmdInputEcho("hello", "") == "hello",
+            "strip cmd echo: empty sent-input returns original");
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
@@ -539,6 +560,13 @@ public class ConsoleWorkerTests
                 Assert(!timedOut, $"{profile.label}: simple echo did not time out");
                 Assert(output.Contains(profile.simpleEchoExpect),
                     $"{profile.label}: simple echo output contains expected text (got: {output.Replace("\n", "\\n")})");
+                // Strict echo check: the captured output must NOT contain the
+                // typed command itself (e.g. "echo hello cmd"). pwsh and bash
+                // strip the input echo via OSC 633 C; cmd's StripCmdInputEcho
+                // does the same job for the cmd path. Regression guard for
+                // the cmd cleanup we added.
+                Assert(!output.Contains(profile.simpleEcho),
+                    $"{profile.label}: input echo stripped from output (got: {output.Replace("\n", "\\n")})");
                 if (profile.assertExitCode)
                 {
                     var exitCode = resp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : -1;

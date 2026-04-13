@@ -467,6 +467,55 @@ public class ConsoleWorker
         }
     }
 
+    /// <summary>
+    /// Strip the leading bytes that ConPTY echoed back when an AI command
+    /// was written to cmd.exe's PTY input. cmd has no preexec hook to fire
+    /// OSC 633 C at the right moment, so the proxy tracker captures the
+    /// command echo as part of the output. We know exactly which bytes were
+    /// written, so the cleanup is deterministic: walk the output forwards,
+    /// matching characters from the expected echo, skipping CR/LF inserted
+    /// by ConPTY's terminal-width line wrap. After the echo is consumed,
+    /// drop any trailing newline that separates it from the real output.
+    ///
+    /// On any mismatch (escape characters that don't roundtrip exactly,
+    /// unexpected wrap behaviour) the original output is returned unchanged
+    /// so the AI gets at-worst the pre-fix ugliness, never lost data.
+    /// </summary>
+    internal static string StripCmdInputEcho(string output, string sentInput)
+    {
+        if (string.IsNullOrEmpty(output) || string.IsNullOrEmpty(sentInput))
+            return output;
+
+        int oi = 0;
+        int ci = 0;
+        while (ci < sentInput.Length && oi < output.Length)
+        {
+            var oc = output[oi];
+            // ConPTY wraps long input echo at terminal width by injecting
+            // CR/LF into the output stream — those bytes were never in the
+            // typed command, so skip them while continuing to match.
+            if (oc is '\r' or '\n')
+            {
+                oi++;
+                continue;
+            }
+
+            if (oc != sentInput[ci])
+                return output;
+
+            oi++;
+            ci++;
+        }
+
+        if (ci < sentInput.Length)
+            return output;
+
+        while (oi < output.Length && output[oi] is '\r' or '\n')
+            oi++;
+
+        return output[oi..];
+    }
+
     private static string? LoadEmbeddedScript(string name)
     {
         var assembly = Assembly.GetExecutingAssembly();
@@ -1439,9 +1488,24 @@ public class ConsoleWorker
         try
         {
             var result = await resultTask;
+            var cleanedOutput = result.Output;
+            if (shellName is "cmd")
+            {
+                // cmd has no preexec hook, so the OSC C marker can't separate
+                // the ConPTY input echo from the command output the way pwsh /
+                // bash do. Strip the echoed input bytes from the head of the
+                // captured slice instead — that's the exact bytes we wrote to
+                // the PTY (single-line: the literal command; multi-line: the
+                // `call "tmp" & del "tmp"` wrapper). enter is dropped because
+                // it's the line submission and never appears in the echo.
+                var echoExpected = ptyPayload;
+                if (echoExpected.EndsWith(enter))
+                    echoExpected = echoExpected[..^enter.Length];
+                cleanedOutput = StripCmdInputEcho(cleanedOutput, echoExpected);
+            }
             return SerializeResponse(w =>
             {
-                w.WriteStringOrNull("output", result.Output);
+                w.WriteStringOrNull("output", cleanedOutput);
                 w.WriteNumber("exitCode", result.ExitCode);
                 w.WriteStringOrNull("cwd", result.Cwd);
                 w.WriteStringOrNull("duration", result.Duration);
