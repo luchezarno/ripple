@@ -194,33 +194,44 @@ public class ConsoleWorker
         var enter = _adapter?.Input.LineEnding
             ?? ConsoleManager.EnterKeyFor(shellName);
 
-        if (ConsoleManager.IsPowerShellFamily(shellName))
-        {
-            // pwsh with -NoExit -Command sources the integration script during
-            // startup, then drops into interactive mode where the overridden
-            // prompt function emits the first OSC A automatically. Go straight
-            // to WaitForReady — no settle wait, no kick Enter. This was the
-            // biggest contributor to auto-start latency (~2s).
-        }
-        else if (shellName is "cmd")
-        {
-            // cmd.exe with /k prompt doesn't paint the first prompt until it
-            // reads input. Let the welcome banner finish, then kick an Enter
-            // so the OSC-aware prompt runs.
+        // Milestone 2f: ready-phase orchestration is driven by adapter.Ready
+        // fields. Three paths emerge from the four shells:
+        //
+        //   pwsh  - integration was loaded via -Command at launch; the first
+        //           OSC A fires automatically. No settle, no inject, no kick.
+        //   cmd   - /k prompt doesn't paint until it reads input. Settle,
+        //           then kick Enter to render the OSC-aware prompt — that
+        //           kick IS the ready signal, so it happens BEFORE
+        //           WaitForReady.
+        //   bash/zsh - settle, suppress mirror, inject the integration
+        //           script via PTY stdin, settle again. The kick happens
+        //           AFTER WaitForReady so the suppressed prompt is redrawn.
+        //
+        // suppress_mirror_during_inject is the discriminator between the
+        // cmd path (kick-before-ready) and the bash/zsh path (inject +
+        // kick-after-ready), since both have kick_enter_after_ready=true.
+        var settleMs = _adapter?.Ready.SettleBeforeInjectMs
+            ?? (ConsoleManager.IsPowerShellFamily(shellName) ? 0 : 2000);
+        var suppressMirror = _adapter?.Ready.SuppressMirrorDuringInject
+            ?? (!ConsoleManager.IsPowerShellFamily(shellName) && shellName is not "cmd");
+        var kickEnter = _adapter?.Ready.KickEnterAfterReady
+            ?? !ConsoleManager.IsPowerShellFamily(shellName);
+        var delayAfterInject = _adapter?.Ready.DelayAfterInjectMs
+            ?? (suppressMirror ? 500 : 0);
+
+        if (settleMs > 0)
             await WaitForOutputSettled(ct);
-            await WriteToPty(enter, ct);
-        }
-        else
+
+        if (suppressMirror)
         {
-            // bash/zsh and others: wait for initial output to settle so the
-            // shell is past its welcome banner and ready to accept input,
-            // then inject the integration script via PTY stdin. Output
-            // mirroring is suppressed during injection to hide the `source`
-            // echo and any noise from loading the script.
-            await WaitForOutputSettled(ct);
             _mirrorVisible = false;
             await InjectShellIntegration(ct);
-            await Task.Delay(500, ct);
+            if (delayAfterInject > 0)
+                await Task.Delay(delayAfterInject, ct);
+        }
+        else if (kickEnter)
+        {
+            await WriteToPty(enter, ct);
         }
 
         // Wait for PromptStart marker from shell integration (confirms OSC pipeline is working)
@@ -241,7 +252,9 @@ public class ConsoleWorker
 
         // For shells with PTY-injected integration (bash/zsh), the prompt drawn
         // during injection was suppressed. Send a kick to draw a fresh prompt.
-        if (!ConsoleManager.IsPowerShellFamily(shellName) && shellName is not "cmd")
+        // Milestone 2f: gated on suppressMirror (the inject path) so cmd's
+        // pre-ready kick isn't duplicated here.
+        if (suppressMirror && kickEnter)
         {
             await WriteToPty(enter, ct);
         }
