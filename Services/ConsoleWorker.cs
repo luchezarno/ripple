@@ -417,13 +417,14 @@ public class ConsoleWorker
 
         if (_isPwshFamily)
         {
-            // Milestone 2d: integration script comes from the adapter when
-            // loaded (YAML's script_resource is resolved to the embedded
-            // resource at startup), else fall back to the direct embedded
-            // resource read for unknown shell families.
-            var script = _adapter?.IntegrationScript
-                ?? LoadEmbeddedScript("integration.ps1");
-            if (script != null)
+            // Milestone 2d: integration script comes from the adapter
+            // (AdapterLoader resolves YAML's script_resource to the
+            // embedded ShellIntegration/integration.ps1 content at
+            // startup). Milestone 2j: the pre-phase-B LoadEmbeddedScript
+            // fallback was removed after every in-tree shell got a YAML
+            // adapter; unknown pwsh-family shells without an adapter now
+            // fall through to the generic launch path below.
+            if (_adapter?.IntegrationScript is { } script)
             {
                 // Milestone 2e-3: assemble the tempfile body, init invocation,
                 // and outer command line by expanding adapter templates. The
@@ -570,16 +571,13 @@ public class ConsoleWorker
         // injected via BuildCommandLine's -Command argument, and cmd sets
         // its PROMPT at /k startup. So the old dead pwsh branch here used
         // to never fire — it's gone now.
+        //
+        // Milestone 2d: adapter.IntegrationScript is resolved from YAML's
+        // script_resource at startup. Milestone 2j: the embedded-resource
+        // fallback was removed once every in-tree POSIX shell had a YAML
+        // adapter; shells without an adapter fall through to no-OSC mode.
         var shellName = _shellFamily;
-        // Milestone 2d: prefer adapter's IntegrationScript (resolved from
-        // YAML's script_resource at load time), fall back to the old
-        // shell-family dispatch for shells without an adapter.
-        string? script = _adapter?.IntegrationScript
-            ?? shellName switch
-            {
-                "zsh" => LoadEmbeddedScript("integration.zsh"),
-                _    => LoadEmbeddedScript("integration.bash"),
-            };
+        string? script = _adapter?.IntegrationScript;
 
         if (script == null)
         {
@@ -792,16 +790,6 @@ public class ConsoleWorker
             oi++;
 
         return output[oi..];
-    }
-
-    private static string? LoadEmbeddedScript(string name)
-    {
-        var assembly = Assembly.GetExecutingAssembly();
-        var resourceName = $"Splash.ShellIntegration.{name}";
-        using var stream = assembly.GetManifestResourceStream(resourceName);
-        if (stream == null) return null;
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
     }
 
     private async Task WriteToPty(string text, CancellationToken ct)
