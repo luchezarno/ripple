@@ -268,7 +268,7 @@ Phase B → C → C+ is ~26 commits, each a self-contained story.
 Newest first:
 
 ```
-PENDING  feat(schema): runtime modes graph walker closes §18 Q2
+ac1929f  feat(schema): runtime modes graph walker closes §18 Q2
 654225c  docs(handoff): mark §18 Q1 closed and balanced_parens counter live
 ed3e7fa  feat(schema): runtime balanced_parens counter closes §18 Q1
 a8f56ed  chore(worker): silence CA1416 on GetRegistryPathExt
