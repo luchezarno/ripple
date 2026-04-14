@@ -297,7 +297,28 @@ input:
     cleanup_on_start: true
     stale_ttl_hours: 24
   chunk_delay_ms: 0
+  clear_line: null                      # opt-in per adapter after empirical verification
 ```
+
+- **`clear_line`** — byte sequence the worker writes to the PTY right before
+  each AI command payload, to wipe any keystrokes the user may have typed
+  into the current prompt's line-editor buffer. Without it, user bytes
+  sitting in the buffer get prepended to the AI command and submitted as
+  one garbled line. **Default `null`** (opt-in per adapter): the
+  obvious-looking `"\x01\x0b"` (Ctrl-A + Ctrl-K) works against emacs-mode
+  readline / PSReadLine / libedit / JLine, but several shipped REPLs
+  deliberately run without a line editor — Python `PYTHON_BASIC_REPL=1`,
+  fsi `--readline-`, Racket `-i`, CCL, ABCL — and pass raw bytes straight to
+  the parser, which rejects `U+0001` as an invalid non-printable character.
+  Empirical verification per adapter is the only way to know what's safe:
+  walk the adapter in splash, type into its console window, run
+  execute_command, confirm the clear bytes wipe the buffer without syntax
+  errors, then add the field. Adapters that haven't been verified should
+  leave it null — "nothing written" means user-typed bytes still corrupt
+  the command, but no new corruption is introduced. The primary defense
+  against focus-induced contamination is the SW_SHOWNOACTIVATE spawn flag
+  in ProcessLauncher, which prevents the new console window from stealing
+  focus to begin with.
 
 - **`multiline_detect`** — how the runtime decides whether a block of input is
   still incomplete:

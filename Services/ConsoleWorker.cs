@@ -2021,6 +2021,28 @@ public class ConsoleWorker
         {
             ptyPayload = command + enter;
         }
+
+        // Wipe any bytes the user may have typed into the current
+        // prompt's line-editor buffer before submitting our command.
+        // The new console window is spawned SW_SHOWNOACTIVATE so it
+        // shouldn't steal focus, but users occasionally click into
+        // splash's window and type a few keystrokes before realising
+        // — without this flush, those bytes would be prepended to
+        // the AI command and submitted as one garbled line.
+        //
+        // The adapter's input.clear_line is null by default (opt-in)
+        // because several shipped REPLs run without a line editor at
+        // all (Python basic mode, fsi --readline-, Racket -i, CCL,
+        // ABCL) and would treat the clear bytes as literal input.
+        // Adapters that have been empirically verified to honor a
+        // known kill-line sequence set it explicitly in YAML.
+        var clearLine = _adapter?.Input.ClearLine;
+        if (!string.IsNullOrEmpty(clearLine))
+        {
+            try { await WriteToPty(clearLine, ct); }
+            catch { /* best-effort — a flush failure shouldn't block execute */ }
+        }
+
         await WriteToPty(ptyPayload, ct);
 
         try

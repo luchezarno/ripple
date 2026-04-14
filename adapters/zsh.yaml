@@ -60,6 +60,15 @@ input:
   line_ending: "\n"
   multiline_detect: prompt_based
   multiline_delivery: direct
+  # zsh's default ZLE binding (zsh-line-editor) is emacs-style
+  # without requiring `bindkey -e`, with Ctrl-A bound to
+  # beginning-of-line and Ctrl-K bound to kill-line. Sending
+  # "\x01\x0b" before each AI command wipes any keystrokes the
+  # user typed into splash's window while it was focused;
+  # no-op on an empty buffer. Users who have explicitly run
+  # `bindkey -v` (vi-mode) see the bytes as keystroke sequences
+  # that are harmless but may surprise them — documented caveat.
+  clear_line: "\u0001\u000b"
 
 signals:
   interrupt: "\x03"

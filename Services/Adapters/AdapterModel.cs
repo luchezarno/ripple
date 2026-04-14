@@ -209,6 +209,44 @@ public class InputSpec
     public BalancedParensSpec? BalancedParens { get; set; }
     public TempfileSpec? Tempfile { get; set; }
     public int ChunkDelayMs { get; set; }
+
+    /// <summary>
+    /// Byte sequence to write to the PTY immediately before the AI
+    /// command payload, to clear whatever the user may have typed
+    /// into the current prompt's line-editor buffer. Without this,
+    /// user keystrokes accumulated while the console window had
+    /// focus (e.g. the user accidentally typed into splash's window
+    /// after a fresh spawn stole focus from their editor) would be
+    /// prepended to the AI command and both would submit together
+    /// as one garbled line.
+    ///
+    /// **Default null** — opt-in per adapter. The obvious-looking
+    /// choice <c>"\u0001\u000b"</c> (Ctrl-A + Ctrl-K) works against
+    /// any <i>emacs-mode readline / PSReadLine / libedit / JLine</i>
+    /// line editor, but several shipped REPLs deliberately run
+    /// without a line editor at all — Python with
+    /// <c>PYTHON_BASIC_REPL=1</c>, F# Interactive with
+    /// <c>--readline-</c>, Racket <c>-i</c>, ABCL, CCL — and pass
+    /// raw bytes straight to the parser, which rejects
+    /// <c>U+0001</c> as an invalid non-printable character. Empirical
+    /// verification per adapter is the only way to know what's
+    /// safe: walk the adapter in splash, type into its console
+    /// window, run execute_command, and confirm the clear bytes
+    /// wipe the buffer without syntax errors.
+    ///
+    /// The Groovy pattern applies: <c>clear_line</c> is declared
+    /// alongside the YAML by whoever ships the adapter after running
+    /// the smoke test. No default means "nothing written" — the
+    /// user-typed bytes still corrupt the command, but no new
+    /// corruption is introduced. Adapters that haven't verified yet
+    /// should leave it null.
+    ///
+    /// Written only when direct PTY write is used — multi-line
+    /// tempfile delivery replaces the whole line buffer with the
+    /// dot-source invocation anyway, so clear_line is unnecessary
+    /// there.
+    /// </summary>
+    public string? ClearLine { get; set; }
 }
 
 public class MultilineWrapperSpec

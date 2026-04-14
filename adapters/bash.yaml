@@ -64,6 +64,15 @@ input:
   multiline_detect: prompt_based
   multiline_delivery: direct
   chunk_delay_ms: 0
+  # bash's interactive line editor is GNU readline in emacs mode
+  # (the default unless the user puts `set -o vi` in .inputrc or
+  # .bashrc). Ctrl-A = beginning-of-line, Ctrl-K = kill-line — both
+  # are no-ops on an empty buffer, so sending "\x01\x0b" before each
+  # AI command is safe and wipes any keystrokes the user typed into
+  # splash's window while it was (briefly) focused. vi-mode users
+  # will experience the bytes as mode-change keystrokes, which is
+  # harmless but unsubtle — documented caveat.
+  clear_line: "\u0001\u000b"
 
 signals:
   interrupt: "\x03"

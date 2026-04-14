@@ -57,6 +57,16 @@ public class ProcessLauncher
     private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
     private const uint CREATE_NEW_CONSOLE = 0x00000010;
 
+    // STARTUPINFOW dwFlags / wShowWindow values used to spawn the
+    // worker console visible-but-inactive so a new splash shell
+    // doesn't steal keyboard focus from the editor or terminal the
+    // user is currently working in. Without these, Windows spawns
+    // CREATE_NEW_CONSOLE children as active foreground windows and
+    // any keystrokes the user types land in splash's shell until
+    // they notice and re-focus their original window.
+    private const uint STARTF_USESHOWWINDOW = 0x00000001;
+    private const ushort SW_SHOWNOACTIVATE = 4;
+
     /// <summary>
     /// Launch a splash console worker (--console mode) with clean environment.
     /// The worker creates a PTY (ConPTY on Windows, forkpty on Linux/macOS),
@@ -147,7 +157,20 @@ public class ProcessLauncher
 
             var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
-            var si = new STARTUPINFOW { cb = (uint)Marshal.SizeOf<STARTUPINFOW>() };
+            // STARTF_USESHOWWINDOW + SW_SHOWNOACTIVATE: display the new
+            // console window without activating it. Windows will put
+            // the worker behind whatever the user is currently focused
+            // on, so their editor / other terminal keeps keyboard focus
+            // and the keystrokes they're already typing don't land in
+            // splash's shell. The console is still fully visible and
+            // the user can click into it deliberately whenever they
+            // want to inspect or interact with the shell.
+            var si = new STARTUPINFOW
+            {
+                cb = (uint)Marshal.SizeOf<STARTUPINFOW>(),
+                dwFlags = STARTF_USESHOWWINDOW,
+                wShowWindow = SW_SHOWNOACTIVATE,
+            };
             var pi = new PROCESS_INFORMATION();
 
             bool ok = CreateProcessW(
