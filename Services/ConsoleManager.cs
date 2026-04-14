@@ -286,12 +286,25 @@ public class ConsoleManager
         return new StartConsoleResult("started", pid, displayName, shellFamily, initialCwd);
     }
 
+    /// The hard ceiling a single execute_command can spend inside the
+    /// MCP tool call, in seconds. Just under the 180s (3-minute) ceiling
+    /// the MCP protocol imposes on tool-call response latency. Kept in
+    /// sync with CommandTracker.PreemptiveTimeoutMs so the worker's
+    /// internal timer always fires before the pipe wait gives up.
+    public const int MaxExecuteTimeoutSeconds = 170;
+
     /// <summary>
     /// Execute a command on the active console via Named Pipe.
     /// Serialized via _toolLock.
     /// </summary>
     public async Task<ExecuteResult> ExecuteCommandAsync(string command, int timeoutSeconds, string agentId = "default", string? shell = null)
     {
+        // Cap the caller-supplied timeout at the MCP ceiling so the
+        // pipe wait + worker timer both unwind within the 3-minute
+        // tool-call window. Callers that ask for longer get a clean
+        // preemptive-timeout response at 170s and can keep polling
+        // via wait_for_completion.
+        timeoutSeconds = Math.Clamp(timeoutSeconds, 1, MaxExecuteTimeoutSeconds);
         await _toolLock.WaitAsync();
         try { return await ExecuteCommandInnerAsync(command, timeoutSeconds, agentId, shell); }
         finally { _toolLock.Release(); }
@@ -400,12 +413,16 @@ public class ConsoleManager
                         w => w.WriteString("type", "get_status"), TimeSpan.FromSeconds(3));
                     sourceCwd = statusResp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
                     var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
-                    // "completed" = worker still has an undelivered cached result from a
-                    // previous timed-out AI command. If we execute here, RegisterCommand
-                    // wipes _cachedResult and the drain via AppendCachedOutputs finds
-                    // nothing — the result is lost and KnownBusyPids never clears.
-                    // Route away instead; the cache will be drained at the end of this
-                    // tool call like any other pending output.
+                    // "completed" = the worker has one or more cached results from
+                    // earlier flipped commands that haven't been drained yet. Routing
+                    // away here isn't strictly required — RegisterCommand no longer
+                    // clears _cachedResults and AppendCachedOutputs drains it at the
+                    // tail of this tool call — but surfacing those results in the
+                    // same response as a brand-new inline execute would conflate
+                    // two unrelated command histories. Stay conservative: treat
+                    // completed as busy for routing purposes so the fresh execute
+                    // lands on a sibling console and the cached results drain
+                    // cleanly on their own line.
                     activeBusy = statusStr == "busy" || statusStr == "completed";
                 }
                 catch { }
@@ -1292,20 +1309,32 @@ public class ConsoleManager
 
                 var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
                 if (cacheStatus != "ok") continue;
+                if (!cachedResp.TryGetProperty("results", out var resultsProp)
+                    || resultsProp.ValueKind != JsonValueKind.Array)
+                    continue;
 
                 var consoleInfo = _consoles.GetValueOrDefault(pid.Value);
                 var displayName = consoleInfo?.DisplayName ?? $"#{pid.Value}";
-                results.Add(new ExecuteResult
+
+                // A single console's cache may hold multiple entries if
+                // sequential commands each flipped to cache mode without
+                // an intervening drain — preserve them all, in order, so
+                // the AI sees the full history on the next tool call.
+                foreach (var entry in resultsProp.EnumerateArray())
                 {
-                    Pid = pid.Value,
-                    Output = cachedResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
-                    ExitCode = cachedResp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
-                    Duration = cachedResp.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
-                    Command = cachedResp.TryGetProperty("command", out var c) ? c.GetString() : null,
-                    DisplayName = displayName,
-                    ShellFamily = consoleInfo?.ShellFamily,
-                    Cwd = cachedResp.TryGetProperty("cwd", out var w) ? w.GetString() : null,
-                });
+                    results.Add(new ExecuteResult
+                    {
+                        Pid = pid.Value,
+                        Output = entry.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
+                        ExitCode = entry.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
+                        Duration = entry.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
+                        Command = entry.TryGetProperty("command", out var c) ? c.GetString() : null,
+                        DisplayName = displayName,
+                        ShellFamily = consoleInfo?.ShellFamily,
+                        Cwd = entry.TryGetProperty("cwd", out var w) ? w.GetString() : null,
+                        StatusLine = entry.TryGetProperty("statusLine", out var sl) ? sl.GetString() : null,
+                    });
+                }
                 UnmarkPipeBusy(agentId, pid.Value);
             }
             catch { }
@@ -1562,18 +1591,27 @@ public class ConsoleManager
 
                     var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
                     if (cacheStatus != "ok") continue;
+                    if (!cachedResp.TryGetProperty("results", out var resultsProp)
+                        || resultsProp.ValueKind != JsonValueKind.Array)
+                        continue;
 
                     var info2 = _consoles.GetValueOrDefault(pid);
-                    completed.Add(new ExecuteResult
+                    var displayName2 = info2?.DisplayName ?? $"#{pid}";
+                    foreach (var entry in resultsProp.EnumerateArray())
                     {
-                        Output = cachedResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
-                        ExitCode = cachedResp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
-                        Duration = cachedResp.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
-                        Command = cachedResp.TryGetProperty("command", out var c) ? c.GetString() : null,
-                        DisplayName = info2?.DisplayName ?? $"#{pid}",
-                        ShellFamily = info2?.ShellFamily,
-                        Cwd = cachedResp.TryGetProperty("cwd", out var w) ? w.GetString() : null,
-                    });
+                        completed.Add(new ExecuteResult
+                        {
+                            Pid = pid,
+                            Output = entry.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
+                            ExitCode = entry.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
+                            Duration = entry.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
+                            Command = entry.TryGetProperty("command", out var c) ? c.GetString() : null,
+                            DisplayName = displayName2,
+                            ShellFamily = info2?.ShellFamily,
+                            Cwd = entry.TryGetProperty("cwd", out var w) ? w.GetString() : null,
+                            StatusLine = entry.TryGetProperty("statusLine", out var sl) ? sl.GetString() : null,
+                        });
+                    }
                     UnmarkPipeBusy(agentId, pid);
                     busyPids.RemoveAt(i);
                 }
@@ -1952,6 +1990,11 @@ public class ConsoleManager
         public string? Cwd { get; set; }
         public bool Switched { get; set; }
         public bool TimedOut { get; set; }
+        // Pre-formatted status line baked in by the worker at Resolve
+        // time (or reconstructed by the proxy for inline results). Cached
+        // drains return this verbatim instead of reformatting with
+        // possibly-stale proxy-side ConsoleInfo metadata.
+        public string? StatusLine { get; set; }
         // Populated only on TimedOut — the recent-output ring snapshot the
         // worker captured at timeout. Lets the AI diagnose stuck commands
         // (watch mode, interactive prompts) without waiting for

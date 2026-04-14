@@ -110,7 +110,7 @@ public class ShellTools
         var sb = new StringBuilder();
         foreach (var r in result.Completed)
         {
-            sb.AppendLine(FormatStatusLine(r));
+            sb.AppendLine(!string.IsNullOrEmpty(r.StatusLine) ? r.StatusLine : FormatStatusLine(r));
             sb.AppendLine();
             sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
             sb.AppendLine();
@@ -147,13 +147,18 @@ public class ShellTools
 
         var result = await consoleManager.SendInputAsync(agentId, console, input);
         if (result == null)
-            return $"No console matches \"{console}\". Use the display name (e.g. \"Poseidon\") or PID shown in previous tool responses.";
+            return await AppendCachedOutputs(consoleManager, agentId,
+                $"No console matches \"{console}\". Use the display name (e.g. \"Poseidon\") or PID shown in previous tool responses.");
 
+        string response;
         if (result.Status == "ok")
-            return $"✓ Sent to {result.DisplayName}.";
-        if (result.Status == "rejected")
-            return $"✗ {result.DisplayName} is not busy. Use execute_command to run commands on idle consoles.";
-        return $"✗ {result.DisplayName}: {result.Error}";
+            response = $"✓ Sent to {result.DisplayName}.";
+        else if (result.Status == "rejected")
+            response = $"✗ {result.DisplayName} is not busy. Use execute_command to run commands on idle consoles.";
+        else
+            response = $"✗ {result.DisplayName}: {result.Error}";
+
+        return await AppendCachedOutputs(consoleManager, agentId, response, excludePid: result.Pid);
     }
 
     [McpServerTool]
@@ -290,10 +295,15 @@ public class ShellTools
         }
         if (report.Finished.Count > 0) sb.AppendLine();
 
-        // Cached command results (timed-out AI commands that have since completed)
+        // Cached command results (timed-out AI commands that have since completed).
+        // Prefer the worker-baked StatusLine so the drained entry reads
+        // exactly the way its inline counterpart would have — the worker
+        // captured the display name / shell family / duration at Resolve
+        // time, which may be more accurate than anything we can reconstruct
+        // from current ConsoleInfo if the console has since been reused.
         foreach (var r in cached)
         {
-            sb.AppendLine(FormatStatusLine(r));
+            sb.AppendLine(!string.IsNullOrEmpty(r.StatusLine) ? r.StatusLine : FormatStatusLine(r));
             sb.AppendLine();
             sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
             sb.AppendLine();

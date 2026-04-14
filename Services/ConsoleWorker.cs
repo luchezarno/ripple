@@ -1813,11 +1813,21 @@ public class ConsoleWorker
         var command = request.TryGetProperty("command", out var cmdProp) ? cmdProp.GetString() ?? "" : "";
         if (string.IsNullOrEmpty(command))
             return SerializeResponse(w => w.WriteString("error", "Missing 'command' field in request"));
-        var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : 30_000;
+        var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : CommandTracker.PreemptiveTimeoutMs;
 
-        // Reject if another command is still running (e.g., timed-out command in background)
+        // Reject if another command is still running (e.g., timed-out command in background).
+        // The arrival of this execute_command is definitive proof that the prior
+        // command's response channel has been lost — the caller cannot both be
+        // awaiting the prior result and issuing a new execute at the same time
+        // (splash has no concept of "target console" in the tool shape — each
+        // new execute replaces the previous expectation). Flip the in-flight
+        // command to cache mode so its result gets appended to _cachedResults
+        // and surfaces on the next drain instead of being silently discarded.
         if (_tracker.Busy)
+        {
+            _tracker.FlipToCacheMode();
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
+        }
 
         // Pre-send syntactic gate for adapters that declare
         // multiline_detect: balanced_parens (Racket today, future Lisp
@@ -1874,6 +1884,10 @@ public class ConsoleWorker
         }
         catch (InvalidOperationException)
         {
+            // Concurrent race path — another execute snuck in between the
+            // Busy check above and here. Flip whatever won the race so its
+            // result still makes it into the cache.
+            _tracker.FlipToCacheMode();
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
         }
 
@@ -2087,18 +2101,26 @@ public class ConsoleWorker
 
     private JsonElement HandleGetCachedOutput()
     {
-        var cached = _tracker.ConsumeCachedOutput();
-        if (cached == null)
+        var cached = _tracker.ConsumeCachedOutputs();
+        if (cached.Count == 0)
             return SerializeResponse(w => w.WriteString("status", "no_cache"));
 
         return SerializeResponse(w =>
         {
             w.WriteString("status", "ok");
-            w.WriteStringOrNull("output", cached.Output);
-            w.WriteNumber("exitCode", cached.ExitCode);
-            w.WriteStringOrNull("cwd", cached.Cwd);
-            w.WriteStringOrNull("command", cached.Command);
-            w.WriteStringOrNull("duration", cached.Duration);
+            w.WriteStartArray("results");
+            foreach (var r in cached)
+            {
+                w.WriteStartObject();
+                w.WriteStringOrNull("output", r.Output);
+                w.WriteNumber("exitCode", r.ExitCode);
+                w.WriteStringOrNull("cwd", r.Cwd);
+                w.WriteStringOrNull("command", r.Command);
+                w.WriteStringOrNull("duration", r.Duration);
+                w.WriteString("statusLine", r.StatusLine);
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
         });
     }
 
@@ -2225,6 +2247,14 @@ public class ConsoleWorker
             var osc = Encoding.UTF8.GetBytes($"\x1b]0;{title}\x07");
             _stdoutStream.Write(osc, 0, osc.Length);
             _stdoutStream.Flush();
+
+            // Keep the tracker's cached-result status lines in sync with
+            // the proxy's current display name. set_title is the earliest
+            // point at which a freshly launched worker learns its name,
+            // so without this, commands registered before the claim path
+            // runs would bake the wrong identity into their cached
+            // status lines.
+            _tracker.SetDisplayContext(title, _shellFamily);
         }
         return SerializeResponse(w => w.WriteString("status", "ok"));
     }
@@ -2330,6 +2360,13 @@ public class ConsoleWorker
 
         var newPipeName = $"{ConsoleManager.PipePrefix}.{proxyPid}.{agentId}.{Environment.ProcessId}";
         if (title != null) Console.Title = title;
+
+        // Propagate the proxy-supplied display name (sent in the claim's
+        // `title` field, already in "Fox" / "Reggae" form) and the
+        // worker's own shell family into the tracker so any command
+        // that ends up cached on this console carries a self-contained
+        // status line matching how inline results are rendered.
+        _tracker.SetDisplayContext(title, _shellFamily);
 
         // New proxy taking ownership — drop whatever is in the
         // recent-output ring. Anything captured before this moment

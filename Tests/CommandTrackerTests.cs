@@ -446,6 +446,295 @@ public class CommandTrackerTests
             Assert(!t.Busy, "polling+osc: clearing both finally clears Busy");
         }
 
+        // ================================================================
+        // Cache / drain tests — exercise FlipToCacheMode, _cachedResults
+        // accumulation, ConsumeCachedOutputs atomic drain semantics, and
+        // the worker-baked StatusLine on cached CommandResult entries.
+        // These back the cache-on-busy-receive pattern the ESC-cancel
+        // recovery path depends on.
+        // ================================================================
+
+        // Helper: drive an AI command through the OSC event sequence that
+        // causes Resolve() to fire. Mirrors what a real shell's integration
+        // script emits around a command cycle.
+        static void DriveResolve(CommandTracker tracker, string output, int exit = 0, string? cwd = null)
+        {
+            tracker.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            if (!string.IsNullOrEmpty(output))
+                tracker.FeedOutput(output);
+            tracker.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: exit));
+            if (cwd != null)
+                tracker.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: cwd));
+            tracker.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+        }
+
+        // A fresh tracker has no cached output and draining returns an
+        // empty list rather than null.
+        {
+            var t = new CommandTracker();
+            Assert(!t.HasCachedOutput, "cache: fresh tracker has no cached output");
+            Assert(t.ConsumeCachedOutputs().Count == 0, "cache: fresh drain returns empty list");
+        }
+
+        // FlipToCacheMode on an idle tracker is a safe no-op — it must not
+        // throw, flip any state, or fabricate cache entries. Matters for
+        // the "any tool arrives" trigger which fires regardless of state.
+        {
+            var t = new CommandTracker();
+            t.FlipToCacheMode();
+            Assert(!t.Busy, "flip: idle no-op leaves Busy=false");
+            Assert(!t.HasCachedOutput, "flip: idle no-op leaves cache empty");
+        }
+
+        // Normal completion path: the command resolves via the _tcs inline,
+        // and the cache stays empty because _shouldCacheOnComplete was never
+        // set. Baseline case for the ESC-free happy path.
+        {
+            var t = new CommandTracker();
+            var task = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            DriveResolve(t, "normal-output\n", exit: 0, cwd: "/home");
+            Assert(task.IsCompletedSuccessfully, "normal: task completed successfully");
+            Assert(task.Result.Output.Contains("normal-output"), "normal: task result has output");
+            Assert(task.Result.ExitCode == 0, "normal: task result has exit code 0");
+            Assert(task.Result.Cwd == "/home", "normal: task result has cwd");
+            Assert(!t.HasCachedOutput, "normal: cache stays empty on normal completion");
+            Assert(!t.Busy, "normal: tracker idle after Resolve");
+        }
+
+        // Mid-command FlipToCacheMode: task faults with TimeoutException,
+        // _shouldCacheOnComplete is set, and when Resolve eventually fires
+        // (OSC D/A arriving later from the shell) the result lands in
+        // _cachedResults rather than the original TCS. This is the core
+        // "response channel broken mid-flight" recovery path.
+        {
+            var t = new CommandTracker();
+            var task = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            Assert(!task.IsCompleted, "flip: task pending before flip");
+
+            t.FlipToCacheMode();
+            Assert(task.IsFaulted, "flip: task faulted after FlipToCacheMode");
+            Assert(task.Exception!.InnerException is TimeoutException,
+                "flip: task fault is TimeoutException");
+            Assert(t.Busy, "flip: tracker still Busy — command still running in shell");
+            Assert(!t.HasCachedOutput, "flip: cache still empty before Resolve fires");
+
+            // Shell eventually emits the command cycle. Since the TCS is
+            // already detached, Resolve's else branch runs and appends.
+            DriveResolve(t, "output-1\n", exit: 0, cwd: "/tmp");
+            Assert(!t.Busy, "flip: tracker idle after Resolve");
+            Assert(t.HasCachedOutput, "flip: cache populated after Resolve");
+
+            var drained = t.ConsumeCachedOutputs();
+            Assert(drained.Count == 1, $"flip: one result drained (got {drained.Count})");
+            Assert(drained[0].Output.Contains("output-1"), "flip: drained result contains command output");
+            Assert(drained[0].ExitCode == 0, "flip: drained exit code preserved");
+            Assert(drained[0].Cwd == "/tmp", "flip: drained cwd preserved");
+            Assert(drained[0].Command == "Get-Date", "flip: drained command text preserved");
+            Assert(!string.IsNullOrEmpty(drained[0].StatusLine), "flip: drained result has non-empty StatusLine");
+
+            Assert(!t.HasCachedOutput, "flip: cache empty after drain");
+            Assert(t.ConsumeCachedOutputs().Count == 0, "flip: second drain returns empty");
+        }
+
+        // Sequential flipped commands accumulate in the cache list without
+        // overwriting each other. Validates that append semantics preserve
+        // order and that a single CommandResult field (the old shape) would
+        // have silently dropped the earlier entry.
+        {
+            var t = new CommandTracker();
+
+            _ = t.RegisterCommand("first", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "first-output\n", exit: 0);
+            Assert(t.HasCachedOutput, "multi: cache has entry after first flip");
+
+            _ = t.RegisterCommand("second", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "second-output\n", exit: 1);
+            Assert(t.HasCachedOutput, "multi: cache still populated after second");
+
+            var drained = t.ConsumeCachedOutputs();
+            Assert(drained.Count == 2, $"multi: two results drained (got {drained.Count})");
+            Assert(drained[0].Command == "first", "multi: first command preserved in order");
+            Assert(drained[0].Output.Contains("first-output"), "multi: first output preserved");
+            Assert(drained[1].Command == "second", "multi: second command preserved in order");
+            Assert(drained[1].Output.Contains("second-output"), "multi: second output preserved");
+            Assert(drained[1].ExitCode == 1, "multi: second non-zero exit code preserved");
+            Assert(!t.HasCachedOutput, "multi: cache empty after drain");
+        }
+
+        // ConsumeCachedOutputs is atomic — one call drains everything,
+        // leaves the list empty, and never returns a partial view. Drain
+        // happens on every tool-call response, so splitting it into pieces
+        // would require multiple round trips to empty the cache.
+        {
+            var t = new CommandTracker();
+            for (int i = 0; i < 3; i++)
+            {
+                _ = t.RegisterCommand($"cmd-{i}", timeoutMs: 30_000);
+                t.FlipToCacheMode();
+                DriveResolve(t, $"out-{i}\n", exit: 0);
+            }
+
+            var drained = t.ConsumeCachedOutputs();
+            Assert(drained.Count == 3, $"atomic: three results drained (got {drained.Count})");
+            Assert(!t.HasCachedOutput, "atomic: cache empty after single drain call");
+            Assert(drained[0].Command == "cmd-0", "atomic: order preserved [0]");
+            Assert(drained[1].Command == "cmd-1", "atomic: order preserved [1]");
+            Assert(drained[2].Command == "cmd-2", "atomic: order preserved [2]");
+        }
+
+        // Cache survives RegisterCommand. A stale entry from an earlier
+        // flipped command must NOT be cleared when a fresh command is
+        // registered — otherwise a user who calls execute twice without
+        // an intervening drain would silently lose the first result.
+        {
+            var t = new CommandTracker();
+
+            _ = t.RegisterCommand("earlier", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "earlier-output\n", exit: 0);
+            Assert(t.CachedOutputCount == 1, "survive: cache has 1 entry");
+
+            // Fresh command on the now-idle tracker. Cache must carry over.
+            var task = t.RegisterCommand("later", timeoutMs: 30_000);
+            Assert(t.CachedOutputCount == 1, "survive: cache preserved across RegisterCommand");
+
+            // Complete the second normally — cache still has only the first.
+            DriveResolve(t, "later-output\n", exit: 0);
+            Assert(task.IsCompletedSuccessfully, "survive: second command completed normally");
+            Assert(t.CachedOutputCount == 1, "survive: normal completion does not add to cache");
+
+            var drained = t.ConsumeCachedOutputs();
+            Assert(drained.Count == 1, $"survive: only the flipped result in cache (got {drained.Count})");
+            Assert(drained[0].Command == "earlier", "survive: earlier (flipped) command preserved");
+        }
+
+        // SetDisplayContext propagates into the baked StatusLine on cached
+        // CommandResult entries. Ensures drain output looks identical to an
+        // inline result — the worker captures display name + shell family
+        // at Resolve time rather than relying on the proxy reformatting.
+        {
+            var t = new CommandTracker();
+            t.SetDisplayContext("Dolphin", "pwsh");
+            _ = t.RegisterCommand("Get-Process", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "proc-output\n", exit: 0, cwd: "C:\\Users");
+
+            var drained = t.ConsumeCachedOutputs();
+            Assert(drained.Count == 1, "statusline: one drained");
+            var sl = drained[0].StatusLine;
+            Assert(sl.Contains("Dolphin"), $"statusline: contains display name — got: {sl}");
+            Assert(sl.Contains("pwsh"), $"statusline: contains shell family — got: {sl}");
+            Assert(sl.Contains("Get-Process"), $"statusline: contains command — got: {sl}");
+            Assert(sl.Contains("Completed"), $"statusline: contains status verb — got: {sl}");
+            Assert(sl.Contains("Location: C:\\Users"),
+                $"statusline: contains location — got: {sl}");
+            Assert(sl.StartsWith("✓"), $"statusline: success marker — got: {sl}");
+        }
+
+        // cmd shell family renders the neutral "Finished / exit code unavailable"
+        // variant because cmd's PROMPT can't expose real %ERRORLEVEL%.
+        {
+            var t = new CommandTracker();
+            t.SetDisplayContext("Catfish", "cmd");
+            _ = t.RegisterCommand("dir", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "Volume in drive C\n", exit: 0);
+
+            var drained = t.ConsumeCachedOutputs();
+            var sl = drained[0].StatusLine;
+            Assert(sl.Contains("Finished"),
+                $"statusline-cmd: says Finished — got: {sl}");
+            Assert(sl.Contains("exit code unavailable"),
+                $"statusline-cmd: notes exit code unavailable — got: {sl}");
+            Assert(!sl.Contains("Completed"),
+                "statusline-cmd: does not say Completed (cmd exits are unreliable)");
+            Assert(sl.StartsWith("○"), $"statusline-cmd: neutral marker — got: {sl}");
+        }
+
+        // Non-zero exit on a reliable shell renders as "Failed (exit N)".
+        {
+            var t = new CommandTracker();
+            t.SetDisplayContext("Wolf", "bash");
+            _ = t.RegisterCommand("false", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "", exit: 1);
+
+            var drained = t.ConsumeCachedOutputs();
+            Assert(drained[0].ExitCode == 1, "statusline-fail: exit code 1 captured");
+            var sl = drained[0].StatusLine;
+            Assert(sl.Contains("Failed"), $"statusline-fail: Failed verb — got: {sl}");
+            Assert(sl.Contains("exit 1"), $"statusline-fail: notes exit 1 — got: {sl}");
+            Assert(sl.StartsWith("✗"), $"statusline-fail: failure marker — got: {sl}");
+        }
+
+        // 170s preemptive cap — RegisterCommand with a huge timeoutMs must
+        // cap internally and not immediately fault. The exact capped value
+        // isn't directly observable but the call must succeed and the task
+        // must stay pending. The capped timer itself is covered by the
+        // short-timeout test below.
+        {
+            var t = new CommandTracker();
+            var task = t.RegisterCommand("long", timeoutMs: 3_600_000); // 1 hour
+            Assert(t.Busy, "cap: Busy after RegisterCommand with large timeout");
+            Assert(!task.IsCompleted, "cap: task not completed immediately");
+            // Drive Resolve so the next test starts fresh.
+            DriveResolve(t, "ok\n", exit: 0);
+            Assert(task.IsCompletedSuccessfully, "cap: task resolves normally via OSC");
+        }
+
+        // Preemptive timeout fires FlipToCacheMode through the CTS
+        // registration, the task faults with TimeoutException, and the
+        // eventual OSC cycle appends the result to the cache. End-to-end
+        // exercise of the wall-clock path — uses a 1s timeout so the
+        // total test wait is bounded.
+        {
+            var t = new CommandTracker();
+            var task = t.RegisterCommand("slow", timeoutMs: 1000);
+
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (DateTime.UtcNow < deadline && !task.IsCompleted)
+                System.Threading.Thread.Sleep(50);
+
+            Assert(task.IsFaulted, "preempt: task faulted after 1s timeout");
+            Assert(task.Exception!.InnerException is TimeoutException,
+                "preempt: fault is TimeoutException");
+            Assert(t.Busy, "preempt: tracker still busy (command still running in shell)");
+            Assert(!t.HasCachedOutput, "preempt: cache still empty before shell finishes");
+
+            DriveResolve(t, "slow-output\n", exit: 0);
+            Assert(!t.Busy, "preempt: tracker idle after Resolve");
+            Assert(t.HasCachedOutput, "preempt: cache populated after Resolve");
+
+            var drained = t.ConsumeCachedOutputs();
+            Assert(drained.Count == 1, $"preempt: one result drained (got {drained.Count})");
+            Assert(drained[0].Output.Contains("slow-output"),
+                "preempt: output captured via cache path");
+            Assert(drained[0].Command == "slow", "preempt: command text preserved");
+        }
+
+        // CachedOutputCount reflects the current list length without
+        // draining — lets callers detect whether a drain would return
+        // anything without consuming it.
+        {
+            var t = new CommandTracker();
+            Assert(t.CachedOutputCount == 0, "count: initially 0");
+
+            _ = t.RegisterCommand("a", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "a-out\n", exit: 0);
+            Assert(t.CachedOutputCount == 1, "count: 1 after first flip+resolve");
+
+            _ = t.RegisterCommand("b", timeoutMs: 30_000);
+            t.FlipToCacheMode();
+            DriveResolve(t, "b-out\n", exit: 0);
+            Assert(t.CachedOutputCount == 2, "count: 2 after second flip+resolve");
+
+            t.ConsumeCachedOutputs();
+            Assert(t.CachedOutputCount == 0, "count: 0 after drain");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

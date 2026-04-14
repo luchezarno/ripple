@@ -86,8 +86,28 @@ public class CommandTracker
     // the drain_post_output pipe message after each successful execute.
     private readonly StringBuilder _postPrimaryOutput = new();
 
-    // Cached result from timed-out commands
-    private CommandResult? _cachedResult;
+    // Cached results from commands whose response channel was lost —
+    // either a preemptive 170s timeout fired and returned a timeout
+    // response while the command kept running, or a new pipe request
+    // arrived while busy (proving the prior response channel broke)
+    // and FlipToCacheMode flipped the in-flight command. List, not
+    // single, because multiple such events can stack up on one console
+    // before any tool call drains the cache.
+    private readonly List<CommandResult> _cachedResults = new();
+
+    // When true, the in-flight command's Resolve() will append its
+    // result to _cachedResults instead of handing it to _tcs. Set by
+    // FlipToCacheMode when we decide the caller won't receive the
+    // result via the normal channel. Cleared on RegisterCommand for
+    // the next command's lifecycle.
+    private bool _shouldCacheOnComplete;
+
+    // Display identity set by ConsoleWorker at claim time. Used by
+    // Resolve() to bake a self-describing status line into the
+    // CommandResult before it is cached or delivered, so drain
+    // consumers don't have to reformat with proxy-side metadata.
+    private string? _displayName;
+    private string? _shellFamily;
 
     // Last known cwd from any prompt (AI command or user command)
     private string? _lastKnownCwd;
@@ -104,7 +124,25 @@ public class CommandTracker
     }
 
     public bool Busy => _isAiCommand || _userCommandBusy || _userBusyByPolling;
-    public bool HasCachedOutput => _cachedResult != null;
+    public bool HasCachedOutput => _cachedResults.Count > 0;
+    public int CachedOutputCount { get { lock (_lock) return _cachedResults.Count; } }
+
+    /// <summary>
+    /// Set the display identity used for cached result status lines.
+    /// Called by ConsoleWorker when a proxy claims this console, so
+    /// any command that later gets cached already carries a status
+    /// line that matches the display name / shell family the proxy
+    /// uses elsewhere. No-op if called with nulls — the tracker will
+    /// fall back to the pid-only form in BuildStatusLine.
+    /// </summary>
+    public void SetDisplayContext(string? displayName, string? shellFamily)
+    {
+        lock (_lock)
+        {
+            _displayName = displayName;
+            _shellFamily = shellFamily;
+        }
+    }
 
     /// <summary>
     /// Update the polling-based user-busy hint. Used by ConsoleWorker for
@@ -139,16 +177,40 @@ public class CommandTracker
         get { lock (_lock) return _isAiCommand ? _stopwatch?.Elapsed.TotalSeconds : null; }
     }
 
-    public record CommandResult(string Output, int ExitCode, string? Cwd, string? Command, string Duration);
+    public record CommandResult(
+        string Output,
+        int ExitCode,
+        string? Cwd,
+        string? Command,
+        string Duration,
+        string StatusLine);
+
+    // MCP protocol imposes a 3-minute (180s) ceiling on tool-call
+    // response latency. Past that the client stops listening and
+    // anything we try to write is discarded. To guarantee that a
+    // busy execute_command always gets a valid response back before
+    // that ceiling, the tracker caps its own timeout at 170s and
+    // fires FlipToCacheMode at the cap — the execute_command handler
+    // sees the TimeoutException, returns a "timed out, cached for
+    // next tool call" response, and the still-running command's
+    // eventual result is appended to _cachedResults for the next
+    // drain to pick up.
+    public const int PreemptiveTimeoutMs = 170_000;
 
     /// <summary>
     /// Register an AI-initiated command. Returns a Task that completes
     /// when the shell signals command completion via OSC markers.
+    /// The timeout is capped at <see cref="PreemptiveTimeoutMs"/> (170s)
+    /// so the execute_command handler can always return a meaningful
+    /// response within the MCP protocol's 3-minute window, even when
+    /// the underlying command keeps running in the background.
     /// </summary>
-    public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = 30_000)
+    public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = PreemptiveTimeoutMs)
     {
         // Minimum 1 second to avoid CancellationTokenSource(0) race conditions
         timeoutMs = Math.Max(timeoutMs, 1000);
+        // Always cap at the MCP ceiling so the response path stays live.
+        timeoutMs = Math.Min(timeoutMs, PreemptiveTimeoutMs);
 
         lock (_lock)
         {
@@ -164,26 +226,63 @@ public class CommandTracker
             _commandSent = commandText;
             _commandStart = -1;
             _commandEnd = -1;
-            _cachedResult = null;
+            _shouldCacheOnComplete = false;
+            // _cachedResults is NOT cleared here — stale entries from
+            // prior flipped commands stay in the list until a drain
+            // (ConsumeCachedOutputs) picks them up. This is what lets
+            // the next tool call salvage results that were flipped
+            // because the prior response channel broke.
             _postPrimaryOutput.Clear();
             _stopwatch = Stopwatch.StartNew();
 
-            // Setup timeout
+            // Setup preemptive timeout. When the 170s cap (or the
+            // caller's shorter request) fires, we delegate to
+            // FlipToCacheMode so the in-flight command's eventual
+            // result ends up in _cachedResults instead of being
+            // silently discarded. HandleExecuteAsync catches the
+            // TimeoutException and turns it into a "cached for next
+            // tool call" response the AI can act on.
             var timeoutCts = new CancellationTokenSource(timeoutMs);
-            _timeoutReg = timeoutCts.Token.Register(() =>
-            {
-                lock (_lock)
-                {
-                    if (_tcs != null && !_tcs.Task.IsCompleted)
-                    {
-                        var tcs = _tcs;
-                        _tcs = null; // Detach — output capture continues
-                        tcs.TrySetException(new TimeoutException($"Command timed out after {timeoutMs}ms"));
-                    }
-                }
-            });
+            _timeoutReg = timeoutCts.Token.Register(FlipToCacheMode);
 
             return _tcs.Task;
+        }
+    }
+
+    /// <summary>
+    /// Flip the in-flight AI command to cache-on-complete mode. Called
+    /// when the pipe handler decides the response channel to the
+    /// original caller has been lost — either because a preemptive
+    /// 170s timer fired, or because a new pipe request arrived while
+    /// this console was still busy (proving the caller is no longer
+    /// listening for the previous response). The blocked
+    /// <c>_tcs</c> is failed with a <see cref="TimeoutException"/> so
+    /// HandleExecuteAsync unwinds and returns a "cached for next tool
+    /// call" response, and <see cref="Resolve"/> will later append
+    /// the real result to <c>_cachedResults</c> instead of delivering
+    /// it through the dead channel. Safe no-op if there is no
+    /// in-flight AI command or if the TCS is already completed.
+    /// </summary>
+    public void FlipToCacheMode()
+    {
+        lock (_lock)
+        {
+            if (!_isAiCommand) return;
+            _shouldCacheOnComplete = true;
+            if (_tcs != null && !_tcs.Task.IsCompleted)
+            {
+                var tcs = _tcs;
+                _tcs = null; // Detach — output capture continues
+                // Do NOT dispose _timeoutReg here — FlipToCacheMode can be
+                // invoked FROM the registration callback (RegisterCommand
+                // wires the 170s preemptive timeout to this method), and
+                // CancellationTokenRegistration.Dispose blocks until the
+                // callback finishes, which would deadlock against the
+                // thread currently inside the callback. The registration
+                // is cleaned up by Resolve() / AbortPending() when the
+                // command eventually completes.
+                tcs.TrySetException(new TimeoutException("Response channel lost, command flipped to cache mode"));
+            }
         }
     }
 
@@ -877,15 +976,21 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Consume cached output from a timed-out command that has since completed.
+    /// Atomically drain all cached command results and clear the
+    /// internal list. Each call returns the complete set of cached
+    /// entries accumulated since the last drain — never partial.
+    /// Callers render every returned CommandResult (each has its own
+    /// baked-in status line) so nothing is silently lost when multiple
+    /// flipped commands stacked up before the drain fired.
     /// </summary>
-    public CommandResult? ConsumeCachedOutput()
+    public List<CommandResult> ConsumeCachedOutputs()
     {
         lock (_lock)
         {
-            var result = _cachedResult;
-            _cachedResult = null;
-            return result;
+            if (_cachedResults.Count == 0) return new List<CommandResult>();
+            var drained = new List<CommandResult>(_cachedResults);
+            _cachedResults.Clear();
+            return drained;
         }
     }
 
@@ -989,22 +1094,70 @@ public class CommandTracker
         {
             var output = CleanOutput();
             var duration = _stopwatch?.Elapsed.TotalSeconds.ToString("F1") ?? "0.0";
-            var result = new CommandResult(output, _exitCode, _cwd, _commandSent, duration);
+            var statusLine = BuildStatusLine(_commandSent, _exitCode, duration, _cwd, _shellFamily, _displayName);
+            var result = new CommandResult(output, _exitCode, _cwd, _commandSent, duration, statusLine);
 
-            if (_tcs != null && !_tcs.Task.IsCompleted)
+            var deliverInline = !_shouldCacheOnComplete
+                                && _tcs != null
+                                && !_tcs.Task.IsCompleted;
+
+            if (deliverInline)
             {
-                var tcs = _tcs;
+                var tcs = _tcs!;
                 _timeoutReg.Dispose();
                 Cleanup();
                 tcs.TrySetResult(result);
             }
             else
             {
-                // Timed out earlier — cache result for wait_for_completion
-                _cachedResult = result;
+                // Response channel is known broken (either FlipToCacheMode
+                // fired, or the timeout CancellationTokenSource already
+                // detached _tcs before Resolve got called). Append to the
+                // cache list so the next tool call's drain picks it up.
+                // The command has finished running by now, so disposing
+                // the timer registration is safe — no more callbacks
+                // will fire even if we hadn't.
+                _timeoutReg.Dispose();
+                _cachedResults.Add(result);
+                _shouldCacheOnComplete = false;
                 Cleanup();
             }
         }
+    }
+
+    /// <summary>
+    /// Build a self-describing status line for a command result, using
+    /// what the worker knows at Resolve time: the proxy-supplied
+    /// display name, the adapter's shell family, the command text,
+    /// exit code, duration and resolved cwd. Baking this into the
+    /// CommandResult (rather than formatting at drain time on the
+    /// proxy side) keeps cached results self-contained: a cache
+    /// drain just reads the status line out and prints it, without
+    /// having to re-join metadata from the proxy's ConsoleInfo
+    /// which may have drifted since the command was registered.
+    /// Mirrors the visual format ShellTools.FormatStatusLine produces
+    /// for inline results.
+    /// </summary>
+    private static string BuildStatusLine(
+        string? command, int exitCode, string duration, string? cwd,
+        string? shellFamily, string? displayName)
+    {
+        var identity = string.IsNullOrEmpty(displayName) ? "" : displayName;
+        var shell = string.IsNullOrEmpty(shellFamily) ? "" : $" ({shellFamily})";
+        var cwdInfo = string.IsNullOrEmpty(cwd) ? "" : $" | Location: {cwd}";
+        var trimmed = command?.Trim();
+        var cmd = trimmed is { Length: > 60 } ? trimmed[..60] + "..." : trimmed;
+
+        // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
+        // worker always reports ExitCode=0 for cmd. Render a neutral
+        // "Finished" line with no success marker so the AI doesn't assume
+        // every cmd command succeeded.
+        if (shellFamily == "cmd")
+            return $"○ {identity}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+
+        return exitCode == 0
+            ? $"✓ {identity}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}"
+            : $"✗ {identity}{shell} | Status: Failed (exit {exitCode}) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
     }
 
     /// <summary>

@@ -222,21 +222,121 @@ public class ConsoleWorkerTests
             Assert(status == "busy", $"Status is busy while command runs (got: {status})");
 
             // Poll for cached output until it's ready (max ~3s).
+            // get_cached_output returns a `results` array — one entry per
+            // cached CommandResult on the console. A single flipped
+            // command shows up as results[0].
             string? cachedOutput = null;
             var deadline = DateTime.UtcNow.AddSeconds(3);
             while (DateTime.UtcNow < deadline)
             {
                 var cacheResp = await SendRequest(pipeName, w => w.WriteString("type", "get_cached_output"));
                 var cacheStatus = cacheResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
-                if (cacheStatus == "ok")
+                if (cacheStatus == "ok"
+                    && cacheResp.TryGetProperty("results", out var resultsProp)
+                    && resultsProp.ValueKind == System.Text.Json.JsonValueKind.Array
+                    && resultsProp.GetArrayLength() > 0)
                 {
-                    cachedOutput = cacheResp.TryGetProperty("output", out var co) ? co.GetString() : null;
+                    var first = resultsProp[0];
+                    cachedOutput = first.TryGetProperty("output", out var co) ? co.GetString() : null;
                     break;
                 }
                 await Task.Delay(200);
             }
             Assert(cachedOutput != null && cachedOutput.Contains("slow done"),
                 $"Cached output contains expected result (got: {(cachedOutput ?? "<null>").Replace("\n", "\\n")})");
+        }
+
+        // Test 8b: multi-entry cache drain. Two commands on the same
+        // console, both hit short-timeout preemptive flips before any
+        // drain runs, their results stack in the tracker's
+        // _cachedResults list. A single get_cached_output call must
+        // return BOTH entries in the `results` array, in registration
+        // order, each with its own baked statusLine. Regression guard
+        // for the "single CommandResult field silently overwrites the
+        // previous" bug shape the list-based cache fixes.
+        {
+            var slow1 = OperatingSystem.IsWindows()
+                ? "Start-Sleep -Milliseconds 1200; Write-Output 'first-cached'"
+                : "sleep 1.2; echo 'first-cached'";
+            var slow2 = OperatingSystem.IsWindows()
+                ? "Start-Sleep -Milliseconds 1200; Write-Output 'second-cached'"
+                : "sleep 1.2; echo 'second-cached'";
+
+            // First command — flips at 300ms, response returns timedOut=true.
+            var r1 = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", slow1); w.WriteNumber("timeout", 300); }, TimeSpan.FromSeconds(5));
+            Assert(r1.TryGetProperty("timedOut", out var t1) && t1.GetBoolean(),
+                "multi-cache: first execute timedOut=true");
+
+            // Wait for the first command's shell-side Resolve to land in
+            // the cache list. Without this, the second RegisterCommand
+            // sees the tracker still Busy and rejects with "busy".
+            var settle1Deadline = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < settle1Deadline)
+            {
+                var st = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
+                var stStr = st.TryGetProperty("status", out var s) ? s.GetString() : null;
+                if (stStr != "busy") break;
+                await Task.Delay(100);
+            }
+
+            // Second command — reuses the same console. Cache should now
+            // carry first-cached, and a fresh RegisterCommand must NOT
+            // clear it (see CommandTracker: RegisterCommand preserves
+            // _cachedResults across command boundaries).
+            var r2 = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", slow2); w.WriteNumber("timeout", 300); }, TimeSpan.FromSeconds(5));
+            Assert(r2.TryGetProperty("timedOut", out var t2) && t2.GetBoolean(),
+                "multi-cache: second execute timedOut=true");
+
+            // Wait for the second command to also land in the cache.
+            var settle2Deadline = DateTime.UtcNow.AddSeconds(5);
+            int cacheCount = 0;
+            List<string> cachedOutputs = new();
+            List<string?> cachedStatusLines = new();
+            while (DateTime.UtcNow < settle2Deadline)
+            {
+                var status = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
+                var hasCached = status.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
+                var busy = (status.TryGetProperty("status", out var sp) ? sp.GetString() : null) == "busy";
+                if (!busy && hasCached)
+                {
+                    var drain = await SendRequest(pipeName, w => w.WriteString("type", "get_cached_output"));
+                    var dStatus = drain.TryGetProperty("status", out var ds) ? ds.GetString() : null;
+                    if (dStatus == "ok"
+                        && drain.TryGetProperty("results", out var results)
+                        && results.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        cacheCount = results.GetArrayLength();
+                        foreach (var entry in results.EnumerateArray())
+                        {
+                            cachedOutputs.Add(entry.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "");
+                            cachedStatusLines.Add(entry.TryGetProperty("statusLine", out var sl) ? sl.GetString() : null);
+                        }
+                    }
+                    break;
+                }
+                await Task.Delay(200);
+            }
+
+            Assert(cacheCount == 2,
+                $"multi-cache: two cached entries drained from one RPC (got {cacheCount})");
+            if (cacheCount == 2)
+            {
+                Assert(cachedOutputs[0].Contains("first-cached"),
+                    $"multi-cache: first entry preserves output (got: {cachedOutputs[0].Replace("\n", "\\n")})");
+                Assert(cachedOutputs[1].Contains("second-cached"),
+                    $"multi-cache: second entry preserves output (got: {cachedOutputs[1].Replace("\n", "\\n")})");
+                Assert(!string.IsNullOrEmpty(cachedStatusLines[0]),
+                    "multi-cache: first entry has baked statusLine");
+                Assert(!string.IsNullOrEmpty(cachedStatusLines[1]),
+                    "multi-cache: second entry has baked statusLine");
+
+                // Second drain after the first must be empty — the whole
+                // list is atomically consumed per call.
+                var drain2 = await SendRequest(pipeName, w => w.WriteString("type", "get_cached_output"));
+                var d2Status = drain2.TryGetProperty("status", out var d2s) ? d2s.GetString() : null;
+                Assert(d2Status == "no_cache",
+                    $"multi-cache: follow-up drain returns no_cache (got: {d2Status})");
+            }
         }
 
         // Test 9: send_input rejected on idle console.
