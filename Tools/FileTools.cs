@@ -14,6 +14,7 @@ public class FileTools
 {
     private const int BinaryCheckBytes = 8192;
     private const int MaxLineLength = 10000;
+    private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
     private static readonly HashSet<string> SkipDirs = new(StringComparer.OrdinalIgnoreCase)
     {
         "node_modules", ".git", ".hg", ".svn", "__pycache__",
@@ -70,7 +71,7 @@ public class FileTools
         if (dir != null && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
-        File.WriteAllText(path, content, Encoding.UTF8);
+        File.WriteAllText(path, content, Utf8NoBom);
         var lines = content.Count(c => c == '\n') + 1;
         return Task.FromResult($"Written {lines} lines to {path}");
     }
@@ -104,7 +105,7 @@ public class FileTools
                 idx = content.IndexOf(old_string, lastEnd, StringComparison.Ordinal);
             }
             sb.Append(content, lastEnd, content.Length - lastEnd);
-            File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+            File.WriteAllText(path, sb.ToString(), Utf8NoBom);
             return Task.FromResult($"Replaced {count} occurrence{(count > 1 ? "s" : "")} in {path}");
         }
 
@@ -119,7 +120,7 @@ public class FileTools
         }
 
         var result = string.Concat(content.AsSpan(0, firstIdx), new_string, content.AsSpan(firstIdx + old_string.Length));
-        File.WriteAllText(path, result, Encoding.UTF8);
+        File.WriteAllText(path, result, Utf8NoBom);
         return Task.FromResult($"Replaced 1 occurrence in {path}");
     }
 
