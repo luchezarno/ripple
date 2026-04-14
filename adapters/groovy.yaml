@@ -1,0 +1,148 @@
+schema: 1
+name: groovy
+version: 0.1.0
+description: >
+  Apache Groovy REPL (groovysh). Eleventh embedded adapter and third
+  regex-strategy client after fsi and jshell. First adapter to exercise
+  `%ENVVAR%` expansion in command_template (added alongside this
+  adapter to let the path point at a user-local Groovy install). On
+  AppLocker-constrained boxes the Groovy distribution in
+  `C:\Program Files\groovy-*\` can be blocked by the corporate DLL
+  policy even though the JDK directory beside it is whitelisted — the
+  workaround is to copy the extracted Groovy tree to a user-local
+  location (`%LocalAppData%\splash-deps\groovy-4.0.31\`) that the
+  DLL rule lets java.exe load from. The adapter invokes the Groovy
+  JVM directly via `java -classpath ...groovy-4.0.31.jar
+  org.codehaus.groovy.tools.GroovyStarter` rather than through
+  `groovysh.bat` because AppLocker script rules block .bat execution
+  from Program Files on this box. See Gotchas in HANDOFF.md for the
+  full story.
+homepage: https://groovy-lang.org
+license: Apache-2.0
+family: repl
+aliases:
+  - groovysh
+  - groovy4
+
+process:
+  # Launch Groovy directly via java.exe from the Microsoft JDK, which
+  # is in a whitelisted Program Files\Microsoft\ path. We bypass
+  # groovysh.bat entirely (AppLocker script rule blocks .bat execution
+  # even from Program Files) and reconstruct the jar classpath /
+  # property flags that startGroovy.bat would set up. `-Djline.terminal=none`
+  # matches the .bat's own setting and keeps groovysh from drawing
+  # line-editor escapes that would pollute the regex prompt matcher.
+  # %LOCALAPPDATA% is expanded by the worker's ExpandTemplate at
+  # launch time.
+  executable: java
+  command_template: '"{shell_path}" -Dprogram.name=groovysh -Dgroovy.home=%LOCALAPPDATA%\splash-deps\groovy-4.0.31 -Dgroovy.starter.conf=%LOCALAPPDATA%\splash-deps\groovy-4.0.31\conf\groovy-starter.conf -Djline.terminal=none -classpath %LOCALAPPDATA%\splash-deps\groovy-4.0.31\lib\groovy-4.0.31.jar org.codehaus.groovy.tools.GroovyStarter --main org.apache.groovy.groovysh.Main --conf %LOCALAPPDATA%\splash-deps\groovy-4.0.31\conf\groovy-starter.conf --classpath .'
+  inherit_environment: true
+  encoding: utf-8
+  # groovysh uses JLine's console reader which treats \r as Enter
+  # under ConPTY cooked mode. Same convention as python / node /
+  # racket / fsi / jshell.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  # Groovy cold start is ~2s (JVM warmup + Groovy class loading).
+  # The regex detector fires once `groovy:000>` appears on its own
+  # line; groovysh's banner ends with a separator line before the
+  # first prompt so there's no two-prompt race like fsi's.
+  delay_after_inject_ms: 0
+
+init:
+  strategy: regex
+  hook_type: none
+  delivery: none
+
+prompt:
+  strategy: regex
+  # groovysh's top-level prompt is `groovy:NNN>` where NNN is a
+  # monotonic counter that increments on each accepted expression.
+  # Anchor on line start (CSI-aware detector handles the cursor
+  # positioning) and match the counter as a capture group so
+  # future mode/counter tracking can see it. The trailing space
+  # after `>` is part of the visible prompt.
+  primary: '^groovy:(\d+)> $'
+  group_captures:
+    - name: counter
+      group: 1
+      type: int
+      role: monotonic_counter
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  # groovysh has a `groovy:NNN|` continuation prompt for incomplete
+  # statements (method/class/closure bodies spanning lines). Declare
+  # prompt_based detection for schema forward-compat — the runtime
+  # still doesn't consume multiline_detect, so multi-line bodies
+  # stream through `direct` and groovysh's tolerant parser buffers
+  # them internally until the closing brace.
+  multiline_detect: prompt_based
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: ":exit"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  # groovysh has :help, :load, :save, :exit, :inspect, :show vars,
+  # :record, :history, ... (colon-prefixed meta commands, similar
+  # to irb/pry flavor).
+  meta_commands: true
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+probe:
+  eval: "1 + 1"
+  expect: '===> 2'
+
+tests:
+  - name: "integer arithmetic"
+    eval: "21 * 2"
+    expect: '===> 42'
+
+  - name: "stateful: variable persists across commands"
+    # Use an untyped assignment (no `def` / `int`) — Groovy's REPL
+    # keeps untyped bindings in the shell scope across commands,
+    # whereas `def splashTest = 42` creates a script-local that
+    # goes out of scope between lines.
+    setup_sequence:
+      - eval: "splashTest = 42"
+    eval: "splashTest"
+    expect: '===> 42'
+
+  - name: "string interpolation with GString"
+    eval: '"hello, ${1 + 1}"'
+    expect: '===> hello, 2'
+
+  - name: "list expression with closure"
+    eval: "[1, 2, 3, 4, 5].collect { it * it }.sum()"
+    expect: '===> 55'

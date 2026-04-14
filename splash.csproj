@@ -47,6 +47,7 @@
     <EmbeddedResource Include="adapters\racket.yaml" />
     <EmbeddedResource Include="adapters\fsi.yaml" />
     <EmbeddedResource Include="adapters\jshell.yaml" />
+    <EmbeddedResource Include="adapters\groovy.yaml" />
   </ItemGroup>
 
 </Project>
