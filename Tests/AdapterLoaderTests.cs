@@ -74,7 +74,10 @@ public static class AdapterLoaderTests
                 "pwsh: capabilities.exit_code == true");
         }
 
-        // bash-specific: PS0 hook, direct multiline delivery
+        // bash-specific: PS0 hook, direct multiline delivery, and the
+        // empirically-verified line-editor clear_line opt-in that
+        // flushes buffered user keystrokes before each AI command
+        // (see commit c90d3f1 for context).
         var bash = registry.Find("bash");
         if (bash != null)
         {
@@ -85,9 +88,24 @@ public static class AdapterLoaderTests
                 "bash: process.inherit_environment == true (MSYS2 needs it)");
             Assert(bash.Capabilities.JobControl == true,
                 "bash: capabilities.job_control == true");
+            Assert(bash.Input.ClearLine == "\u0001\u000b",
+                "bash: input.clear_line == Ctrl-A+Ctrl-K (readline emacs mode)");
         }
 
-        // cmd-specific: unreliable exit code + deterministic echo strip
+        // zsh opts into the same clear_line sequence as bash since ZLE
+        // defaults to emacs-mode bindings with Ctrl-A / Ctrl-K doing
+        // beginning-of-line / kill-line.
+        var zsh = registry.Find("zsh");
+        if (zsh != null)
+        {
+            Assert(zsh.Input.ClearLine == "\u0001\u000b",
+                "zsh: input.clear_line == Ctrl-A+Ctrl-K (ZLE emacs default)");
+        }
+
+        // cmd-specific: unreliable exit code + deterministic echo strip.
+        // clear_line is deliberately null because cmd has no line editor
+        // to target — Ctrl-A/Ctrl-K would be injected as literal input
+        // characters into the command the user is building.
         var cmd = registry.Find("cmd");
         if (cmd != null)
         {
@@ -101,6 +119,23 @@ public static class AdapterLoaderTests
                 "cmd: output.input_echo_strategy == deterministic_byte_match");
             Assert(cmd.Capabilities.UserBusyDetection == "process_polling",
                 "cmd: capabilities.user_busy_detection == process_polling");
+            Assert(cmd.Input.ClearLine == null,
+                "cmd: input.clear_line is null (cooked-mode, no line editor)");
+        }
+
+        // REPL adapters that deliberately run without a line editor
+        // (Python basic REPL, fsi --readline-, Racket -i, CCL, ABCL)
+        // MUST have clear_line == null. Shipping "\x01\x0b" to them
+        // produces SyntaxError: invalid non-printable character U+0001
+        // because their parsers receive raw bytes. Regression guard.
+        foreach (var name in new[] { "python", "fsi", "racket", "ccl", "abcl" })
+        {
+            var adapter = registry.Find(name);
+            if (adapter != null)
+            {
+                Assert(adapter.Input.ClearLine == null,
+                    $"{name}: input.clear_line is null (no line editor — raw bytes reach the parser)");
+            }
         }
 
         // Alias test: "powershell" should resolve to the pwsh adapter.
