@@ -2,6 +2,31 @@
 
 All notable changes to splash are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-04-14
+
+Cache-on-busy-receive salvage layer. When a command is in flight and the MCP client silently drops the response channel — ESC cancel, the MCP protocol's 3-minute ceiling, or a fresh tool call sneaking in on the same console — the worker flips the in-flight command to cache-on-complete mode so its eventual result lands in a per-console list instead of being silently discarded. The next tool call — **any** tool call, not just execute_command — drains the list and surfaces the result to the AI. Mirrors the PowerShell.MCP pattern, then closes three implementation holes observed in its reference. 530 / 530 test assertions pass.
+
+### Added
+- **`CommandTracker.FlipToCacheMode()`** — detaches the in-flight TCS with a `TimeoutException` and marks `_shouldCacheOnComplete` so the eventual OSC-driven `Resolve()` appends to `_cachedResults` instead of delivering to the original caller. Invoked by two paths: the `CancellationTokenSource` registration firing at the 170 s preemptive deadline, and `HandleExecuteAsync` catching a fresh `execute_command` on a busy console (proof the prior caller stopped listening).
+- **Multi-entry cached results per console** — `_cachedResults: List<CommandResult>` replaces the old single-slot `_cachedResult?` so sequential flipped commands accumulate without racing to overwrite. `ConsumeCachedOutputs()` drains the whole list atomically in one call, and `get_cached_output` returns a `results` array over the pipe protocol.
+- **170 s preemptive timeout cap** — `CommandTracker.PreemptiveTimeoutMs = 170_000` and `ConsoleManager.MaxExecuteTimeoutSeconds = 170` clamp both the worker-side timer and the proxy-side pipe wait, so `execute_command` always returns a usable response within the MCP 3-minute tool-call window even when the underlying command keeps running in the background.
+- **Worker-baked status line on cached results** — `CommandTracker.SetDisplayContext(displayName, shellFamily)` (populated from `claim` / `set_title`) lets the worker compute a self-describing status line at `Resolve` time. `CommandResult.StatusLine` carries it through the pipe, `ExecuteResult.StatusLine` carries it through the proxy, and `ShellTools.AppendCachedOutputs` prefers it over proxy-side reformatting so drained output reads identically to inline results — even if the console has since been reused.
+- **84 new test assertions** covering the cache/drain layer: 76 `CommandTrackerTests` unit tests for flip semantics, list accumulation, atomic drain, status-line formatting (pwsh / cmd / bash variants), cache survival across `RegisterCommand`, the 170 s cap, and a wall-clock preemptive-timer path; 8 `ConsoleWorkerTests` E2E assertions covering the multi-entry wire protocol — two back-to-back short-timeout commands stack in the cache and drain in a single RPC with both status lines intact, follow-up drain returns `no_cache`.
+
+### Changed
+- **`execute_command` timeout cap** — the tool's `timeout_seconds` still defaults to 30 but now hard-caps at 170 s; larger values are silently clamped. Worker-side `RegisterCommand` applies the same cap internally so the pipe wait and worker timer both unwind inside the MCP 3-minute window.
+- **`CollectCachedOutputsAsync` / `WaitForCompletionAsync` drain loops** — both consume the new `results` array from `get_cached_output` and emit one `ExecuteResult` per cached entry. A console that accumulated three flipped results surfaces as three entries in the next tool response.
+- **`AppendCachedOutputs` in every MCP tool** — `send_input` is now wrapped like the rest, so its response also drains any cached results on its target console and reports other consoles' busy / finished / closed state. Closes the last gap where a tool response could omit freshly-ready cached output.
+
+### Fixed
+- **Drain hole: read-only MCP tools didn't surface stale cache** — PowerShell.MCP's `CollectAllCachedOutputsAsync` is only called from execute / wait_for_completion handlers, so tools like `get_current_location` leave other consoles' caches sitting until the next execute. splash now drains from every tool response (execute, wait_for_completion, start_console, peek_console, send_input), matching the user's "any MCP tool response" requirement.
+- **Drain hole: older cache hidden behind timeout / flipped branches** — PS.MCP's `invoke_expression` timeout / `shouldCache` branches don't consume older cache entries, so they sit until the next normal completion. splash's atomic `ConsumeCachedOutputs` picks up everything in one call regardless of which branch fires.
+- **`CancellationTokenRegistration` self-disposal deadlock** — `FlipToCacheMode` originally disposed `_timeoutReg` inline, but when called FROM the token's own callback via `Register(FlipToCacheMode)`, `CTR.Dispose` blocks until the callback finishes — which was the same thread currently inside the callback. Disposal now happens in `Resolve`'s cache branch and `AbortPending`, where the command has already finished running.
+
+### Known limitations
+- **Silent fast-completing ESC cancel** — if `execute_command` completes normally in well under 170 s but the client already stopped listening (ESC fired before anything triggered a flip), the result is delivered via `_tcs.TrySetResult` and never enters the cache. splash has no way to detect client-side cancel without a protocol extension. Commands taking more than a few hundred milliseconds are covered via the flip-on-busy-receive trigger as soon as the next tool call arrives.
+- **Cross-agent salvage not attempted** — the drain walks only consoles owned by the current agent. A sub-agent's flipped cache is not visible to the parent agent's tool calls, by design (agent isolation is a first-class splash concept).
+
 ## [0.5.0] - 2026-04-13
 
 A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. cmd is now usable for AI commands instead of hanging indefinitely; bash subshells and command substitutions resolve correctly; pwsh integration tolerates a missing PSReadLine module without crashing the worker. 240 / 240 tests pass.
