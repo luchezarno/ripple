@@ -109,6 +109,39 @@ input:
     invocation_template: '_splash_exec_file(r"{path}")'
   chunk_delay_ms: 0
 
+modes:
+  # Python's main interactive REPL — the default mode the adapter boots
+  # into. Mode tracking is currently declarative-only (schema §9); the
+  # runtime does not yet walk the mode graph or enforce exit_commands.
+  # This block exists so the python adapter exercises schema §18 Q2 with
+  # a real debugger example, grounding the exit_commands.effect enum
+  # in concrete evidence rather than theory.
+  - name: main
+    default: true
+    primary: '^>>> $'
+
+  # pdb (Python debugger) — the standard-library debugger that
+  # replaces the REPL's read-eval loop with its own. Entered either
+  # by the user calling pdb.set_trace() / breakpoint() from the main
+  # REPL, or by an unhandled exception under `python -m pdb`. The
+  # nested REPL uses `(Pdb) ` as its prompt and exits via `continue`
+  # (resume execution) or `quit` (raise BdbQuit, which the main REPL
+  # catches and drops back to >>> ). Both paths land the user back at
+  # the python prompt in this adapter's context, so the 4-value
+  # effect enum (resume / return_to_toplevel) is sufficient — no need
+  # for `custom` yet. See SCHEMA.md §18 Q2.
+  - name: pdb
+    auto_enter: true
+    detect: '^\(Pdb\) $'
+    primary: '^\(Pdb\) $'
+    nested: false
+    exit_commands:
+      - { command: "continue", effect: resume }
+      - { command: "c",        effect: resume }
+      - { command: "quit",     effect: return_to_toplevel }
+      - { command: "q",        effect: return_to_toplevel }
+    exit_detect: '^>>> $'
+
 signals:
   interrupt: "\x03"
   eof: "\x04"
@@ -124,6 +157,14 @@ capabilities:
   stateful: true
   interrupt: true
   meta_commands: false
+  # Python can drop into pdb (auto_enter mode in §9) when the user
+  # calls breakpoint() / pdb.set_trace() from inside a function, so
+  # any client walking the mode graph must re-check the current mode
+  # on each response rather than assuming the adapter stays in main.
+  # Current runtime ignores the modes block (declarative-only stub)
+  # but the capability flag lets future clients opt into mode
+  # awareness without a schema bump.
+  auto_modes: true
   async_output: false
   # Python REPL has no per-expression exit code; tracebacks print to
   # stderr but the prompt still returns, so we report 0 for every
