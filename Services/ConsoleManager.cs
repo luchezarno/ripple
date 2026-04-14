@@ -1913,10 +1913,17 @@ public class ConsoleManager
     }
 
     /// <summary>
-    /// Read PATHEXT from registry (System environment).
+    /// Read PATHEXT from registry (System environment). Windows-only
+    /// by construction — the caller (ResolveShellPath) already branches
+    /// on OperatingSystem.IsWindows() before invoking this, but the
+    /// early-return keeps the CA1416 analyzer happy without relying on
+    /// inter-method flow analysis.
     /// </summary>
     private static string[] GetRegistryPathExt()
     {
+        if (!OperatingSystem.IsWindows())
+            return [".exe", ".cmd", ".bat"];
+
         try
         {
             var pathExt = Microsoft.Win32.Registry.GetValue(
