@@ -94,7 +94,7 @@ Claude Code–compatible file primitives (`read_file`, `write_file`, `edit_file`
 
 ## REPL support
 
-On top of the four shells (pwsh/powershell, bash, zsh, cmd), splash ships adapters for eight REPLs: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), and **groovy**. Start any of them with `start_console shell=python` (or `node`, `racket`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
+On top of the four shells (pwsh/powershell, bash, zsh, cmd), splash ships adapters for eight REPLs: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), and **groovysh** (Apache Groovy Shell). Start any of them with `start_console shell=python` (or `node`, `racket`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
 
 All twelve adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.splash/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
 

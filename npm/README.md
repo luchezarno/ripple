@@ -69,7 +69,7 @@ splash opens a **real, visible terminal window**. You see every AI command as it
 
 ### Language REPLs, not just shells
 
-splash isn't limited to the four shells (pwsh/powershell, bash, zsh, cmd) — it also hosts **eight language REPLs**: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), and **groovy**. Same AI affordances apply: load a heavy setup once, pipe results through follow-ups, keep state, step through a multi-line investigation. Tell the AI to drive a **Groovy** REPL for a Spring Boot codebase exploration, a **Jupyter-less Python** session for data shaping, a **Clozure Common Lisp** break loop to debug a live image — all with the same `execute_command` and the same shared-terminal transparency as the shells.
+splash isn't limited to the four shells (pwsh/powershell, bash, zsh, cmd) — it also hosts **eight language REPLs**: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), and **groovysh** (Apache Groovy Shell). Same AI affordances apply: load a heavy setup once, pipe results through follow-ups, keep state, step through a multi-line investigation. Tell the AI to drive a **groovysh** REPL for a Spring Boot codebase exploration, a **Jupyter-less Python** session for data shaping, a **Clozure Common Lisp** break loop to debug a live image — all with the same `execute_command` and the same shared-terminal transparency as the shells.
 
 ## Tools
 
