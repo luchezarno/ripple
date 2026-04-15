@@ -16,8 +16,8 @@ child.on("exit", (code) => process.exit(code ?? 1));
 child.on("error", (err) => {
   if (err.code === "ENOENT") {
     console.error(
-      "splash binary not found. This package requires Windows and .NET 9 Desktop Runtime.\n" +
-        "Download: https://dotnet.microsoft.com/download/dotnet/9.0"
+      "splash binary not found. This package is Windows x64 only.\n" +
+        "See https://github.com/yotsuda/splash for platform support."
     );
   } else {
     console.error(err.message);

@@ -1,6 +1,6 @@
 {
   "name": "@ytsuda/splash",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "description": "Shared console MCP server for any shell (bash, pwsh, cmd) — AI and user work in the same terminal. Real-time command visibility, interactive prompt support, session persistence, multi-shell management with automatic cwd handoff.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",
