@@ -2133,12 +2133,16 @@ public class ConsoleWorker
         }
         catch (TimeoutException)
         {
-            // Snapshot what the console is currently displaying so the AI
-            // can diagnose why the command is still running (watch mode,
-            // stuck at an interactive prompt, etc.). On Windows, prefer
-            // the native screen buffer read (same as peek_console); fall
-            // back to the VT-medium ring buffer on other platforms.
-            var partial = ReadConsoleScreenText() ?? _tracker.GetRecentOutputSnapshot();
+            // Snapshot what THIS command has produced so far so the AI
+            // can diagnose why it's still running (watch mode, stuck at
+            // an interactive prompt, etc.). Scope is the current
+            // in-flight AI command only — NOT the full screen buffer.
+            // Using the screen buffer leaked already-drained results
+            // from previous commands into the partialOutput, which was
+            // confusing ("I already got that get-date result, why is
+            // it showing again?"). peek_console still returns the full
+            // screen for deliberate inspection.
+            var partial = _tracker.GetCurrentAiOutputSnapshot();
             return SerializeResponse(w =>
             {
                 w.WriteString("output", "");

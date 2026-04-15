@@ -544,6 +544,24 @@ public class CommandTracker
     }
 
     /// <summary>
+    /// Snapshot of the AI output accumulated for the current in-flight
+    /// command only (i.e. what FeedOutput has written since the OSC C
+    /// that started this command). Returns an empty string outside an
+    /// AI command. Used by execute_command's timeout response as the
+    /// `partialOutput` payload so the AI sees only the bytes produced
+    /// by the command it just launched — not whatever the shell had
+    /// on screen from previous commands whose results have already
+    /// been drained.
+    /// </summary>
+    public string GetCurrentAiOutputSnapshot()
+    {
+        lock (_lock)
+        {
+            return _isAiCommand ? _aiOutput : "";
+        }
+    }
+
+    /// <summary>
     /// Snapshot the rolling recent-output window as a string, processed
     /// through a VT-lite interpreter so in-place redraws from PSReadLine,
     /// progress bars, and cursor-positioning escape sequences collapse to
