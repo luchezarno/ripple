@@ -94,9 +94,11 @@ Claude Code–compatible file primitives (`read_file`, `write_file`, `edit_file`
 
 ## REPL support
 
-On top of the four shells (pwsh/powershell, bash, zsh, cmd), splash ships adapters for eight REPLs: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), and **groovysh** (Apache Groovy Shell). Start any of them with `start_console shell=python` (or `node`, `racket`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
+On top of the four shells (pwsh/powershell, bash, zsh, cmd), splash ships adapters for eleven REPLs — **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — and for three debuggers — **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Start any of them with `start_console shell=python` (or `node`, `sqlite3`, `perldb`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
 
-All twelve adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.splash/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
+Debugger adapters are a new `family: debugger` class: they expose the regular session contract *plus* a structured `commands.debugger` vocabulary (step_in / step_over / step_out / continue / print / dump / backtrace / source_list / locals / breakpoint_set / ...) so AI agents can drive any debugger using the same operation names, regardless of whether the underlying syntax is `s` (perldb), `step` (jdb), or `s` (pdb).
+
+All eighteen adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.splash/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
 
 ## Multi-shell behavior
 

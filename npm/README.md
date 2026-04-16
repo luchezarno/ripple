@@ -67,9 +67,11 @@ PowerShell on splash is the difference between **"AI can answer one-off question
 
 splash opens a **real, visible terminal window**. You see every AI command as it runs — same characters, same output, same prompt — and you can type into the same window yourself at any time. When a command hangs on an interactive prompt, stalls in watch mode, or just needs a Ctrl+C, the AI can read what's currently on the screen and send keystrokes (Enter, y/n, arrow keys, Ctrl+C) back to the running command — diagnosing and responding without human intervention.
 
-### Language REPLs, not just shells
+### Language REPLs and debuggers, not just shells
 
-splash isn't limited to the four shells (pwsh/powershell, bash, zsh, cmd) — it also hosts **eight language REPLs**: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), and **groovysh** (Apache Groovy Shell). Same AI affordances apply: load a heavy setup once, pipe results through follow-ups, keep state, step through a multi-line investigation. Tell the AI to drive a **groovysh** REPL for a Spring Boot codebase exploration, a **Jupyter-less Python** session for data shaping, a **Clozure Common Lisp** break loop to debug a live image — all with the same `execute_command` and the same shared-terminal transparency as the shells.
+splash isn't limited to the four shells (pwsh/powershell, bash, zsh, cmd) — it also hosts **eleven language REPLs**: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — plus **three interactive debuggers**: **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Same AI affordances apply: load a heavy setup once, pipe results through follow-ups, keep state, step through a multi-line investigation. Tell the AI to drive a **groovysh** REPL for a Spring Boot codebase exploration, a **sqlite3** session for ad-hoc data shaping, a **perldb** breakpoint loop to chase a bug in a live Perl program — all with the same `execute_command` and the same shared-terminal transparency as the shells.
+
+Debuggers expose a structured `commands.debugger` vocabulary (step_in / step_over / continue / print / backtrace / breakpoint_set / ...) so AI agents can drive any debugger using the same operation names, regardless of whether the underlying syntax is `s`, `step`, or something else.
 
 ## Tools
 
