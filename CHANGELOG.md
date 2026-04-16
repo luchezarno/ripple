@@ -2,6 +2,162 @@
 
 All notable changes to splash are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-04-16
+
+First round of **debugger adapters** plus three new REPL adapters and
+two root-cause fixes that together close out the user-input-
+contamination class of flakes. The adapter schema gains three
+additive fields (`process.executable_candidates`,
+`modes.advance_commands`, `commands.debugger`) that let a single
+adapter YAML describe any debugger's step / print / breakpoint
+vocabulary in a vendor-agnostic way — AI agents drive perldb and
+jdb using the same operation names, no per-debugger knowledge
+required. **19 embedded adapters** (up from 12), with perldb / jdb /
+pdb the first members of the `family: debugger` class. `--adapter-
+tests` runs 100 assertions green; window creation during the test
+suite is fully silent (test workers launch with SW_HIDE) so a long
+test run no longer disrupts the user's other windows.
+
+### Added
+- **`family: debugger` adapter framework.** The `family` enum value
+  `debugger` moves from declarative-only (CCL's break-loop mode +
+  python's pdb mode, both inherited inside a REPL) to a first-class
+  adapter type with three independently-verified instances:
+  - **`perldb`** — Perl's `perl -d -e 0` scriptless debugger. Prompt
+    `  DB<N> ` with nested form `  DB<<N>> ` fired on breakpoint
+    pause. Regex strategy + init none. 8 adapter tests, including an
+    end-to-end breakpoint-hit / inspect-parameter / continue /
+    verify-return chain.
+  - **`jdb`** — Java Debugger detached mode (`jdb` with no target
+    class). Prompt `> `. 5 adapter tests covering deferred
+    breakpoint registration, meta-command dispatch, and detached-
+    mode restrictions.
+  - **`pdb`** — Python's built-in debugger via
+    `python -c "import pdb; pdb.Pdb().set_trace()"`. Prompt
+    `(Pdb) `. 6 adapter tests.
+- **`process.executable_candidates`** (schema §3). Ordered list of
+  launcher binaries tried left-to-right with `%VAR%` env-var
+  expansion; first entry that resolves to an existing file wins.
+  Solves the "single absolute path doesn't port across distributions"
+  problem for interpreters with multiple plausible install locations
+  (Strawberry / ActivePerl / Git-bundled perl; Microsoft OpenJDK /
+  Temurin / Corretto / Zulu; python.org / Windows Store / Anaconda).
+  Falls back to the legacy `executable` field, then the adapter name.
+- **`commands.debugger`** (schema §10). Structured debugger-operation
+  vocabulary: navigation (`step_in`, `step_over`, `step_out`,
+  `continue`, `run`), inspection (`print`, `dump`, `backtrace`,
+  `source_list`, `locals`, `where`, `args`), breakpoints
+  (`breakpoint_set`, `breakpoint_set_line`, `breakpoint_list`,
+  `breakpoint_clear_all`). Each field is a command template string
+  with `{expr}` / `{target}` / `{line}` / `{file}` placeholders, or
+  `null` when unsupported. AI agents discover a debugger's syntax
+  from the adapter instead of parsing help text.
+- **`modes.advance_commands`** (schema §9). Distinct from
+  `exit_commands`: advance commands (step_in / step_over / step_out)
+  change position within the same paused mode without leaving it.
+  AI agents use this to distinguish "I stepped one line but I'm
+  still paused" from "I resumed and left the breakpoint".
+- **`sqlite3` REPL adapter.** Launches `sqlite3 :memory:` with
+  `.mode list` + `.headers off` forced at startup so query output
+  is pipe-separated and regex-friendly (sqlite 3.33+ defaults to a
+  pretty "box" render otherwise). Dot-commands documented via
+  `commands.builtin`. 6 tests.
+- **`lua` REPL adapter.** Lua 5.4 interactive interpreter with the
+  classic `> ` prompt. Uses the `=` prefix shortcut (Lua 5.3+) in
+  probes to return values without wrapping in `print()`. 6 tests.
+- **`deno` REPL adapter.** Deno 2.x for JavaScript / TypeScript
+  evaluation. Distinct from the node adapter — Deno evaluates
+  TypeScript directly (`const x: number = 42` works without
+  ts-node), supports top-level await natively, and has built-in
+  Web Platform APIs. `NO_COLOR=1` in the adapter env disables
+  ANSI colorization for clean regex matching. 6 tests.
+- **`--no-user-input` worker flag.** Test workers launched via
+  `AdapterDeclaredTestsRunner` now pass this flag so their
+  `InputForwardLoop` permanently holds (suppresses) user
+  keystrokes. Prevents the user's typing in unrelated windows from
+  leaking into test workers' PTYs and corrupting probe commands —
+  the root cause of the intermittent jshell / node / fsi /
+  jdb-hello flakes on the 0.7 release train.
+- **OSC sequence stripping in `RegexPromptDetector`.**
+  `StripCsiWithMap` now consumes `ESC ] ... BEL` and `ESC ] ... ESC \`
+  in addition to CSI. Fixes the class of failures where ConPTY's
+  window-title setter (`ESC ] 0 ; <path> BEL`) emitted right after
+  process launch sat between the banner and the prompt, preventing
+  `^` anchoring. 3 regression tests in
+  `RegexPromptDetectorTests`.
+
+### Changed
+- **User input is now held during AI command execution.** A new
+  `_holdUserInput` gate in `ConsoleWorker` causes `InputForwardLoop`
+  to buffer keystrokes into `_heldUserInput` instead of forwarding
+  them to the PTY while `HandleExecuteAsync` is in flight. Held
+  bytes replay automatically after the command completes (success /
+  timeout / error). Ctrl+C (0x03) passes through even when held so
+  the user can always interrupt a stuck command. Operates at
+  splash's own forwarding layer (above the shell), making it
+  universal across adapters regardless of whether the shell has a
+  line editor — the legacy `input.clear_line` path is retained as
+  belt-and-suspenders for characters that slipped into the line
+  editor before the gate was set.
+- **`--adapter-tests` worker console windows are hidden (SW_HIDE).**
+  Normal splash usage keeps `SW_SHOWNOACTIVATE` so the shared
+  console is visible-but-inactive; test runs gate on `noUserInput`
+  to switch to fully invisible windows. Rapid window creation
+  during a full test suite (15+ workers) previously caused focus
+  churn that disrupted the user's other windows — now the entire
+  test run is silent.
+
+### Fixed
+- **`RegexPromptDetector` missed prompts behind OSC window-title
+  sequences.** Pre-0.8 the stripper handled CSI (`ESC [ ... <letter>`)
+  only, leaving OSC sequences intact in the stripped text. When
+  ConPTY emitted `ESC ] 0 ; <path-to-executable> BEL` right before
+  the first prompt (standard terminal behaviour for child-process
+  launches), the title bytes sat between the banner newline and
+  the prompt, and a regex like `^> $` could not anchor. The jdb
+  adapter's initial-prompt detection blocked on this exact pattern
+  (commit `0a98d31`). Fix extends `StripCsiWithMap` with an OSC
+  branch that consumes the sequence entirely via BEL or ST
+  terminator.
+- **`CS8600` compiler warning in
+  `ConsoleWorker.HandleExecuteAsync`.** `ModeMatch` is a record
+  (reference type) so `ModeMatch match = default` gave null and
+  triggered flow-analysis warnings at the post-loop `match.Name`
+  access. The `while(true)` loop always reassigns before the
+  post-loop read, but the compiler can't prove it. Fix (commit
+  `f2f3834`): replace `default` with an explicit
+  `new ModeMatch(Name: null, Level: null)` sentinel so the
+  variable is never null and the safety invariant becomes a
+  constructor invocation rather than an unprovable loop property.
+- **jdb adapter's `next`-stepping test** was state-dependent on
+  a previous test leaving the VM paused at the breakpoint. The
+  state-inheriting design is fragile — the `cont` async race (jdb
+  returns the post-resume prompt immediately while the VM is still
+  running, so `Result: 42` stdout arrives after the test runner
+  has already declared the command complete) is also documented
+  in the adapter YAML's comments for future `async_interleave`
+  work.
+
+### Known limitations
+- **`dotnet-dump analyze` is post-mortem only.** Shipping an
+  adapter for it has the same fixture-dependency problem as
+  `jdb-hello`: a dump file must exist at adapter-launch time.
+  Deferred until there's a concrete workflow that needs dump-
+  analysis integration.
+- **`IPython` prompt detection under ConPTY.** IPython's
+  `--simple-prompt` mode still emits absolute cursor positioning
+  (`\x1b[5;1H`) when it detects a TTY-like environment. `TERM=dumb`
+  and `PROMPT_TOOLKIT_NO_CPR=1` don't override this — it's a
+  ConPTY-specific codepath inside IPython. No IPython adapter
+  ships in 0.8; the stdlib `python` adapter remains the
+  recommended Python REPL.
+- **Adapters using `b subname` on `do`-loaded subs** (perl5db).
+  Setting a function-name breakpoint on a sub that was loaded from
+  an external file via `do 'file.pl'` may silently not fire — the
+  address resolution doesn't always match the file-loaded code.
+  Workaround documented in `perldb.yaml`: use line-number
+  breakpoints (`b {line}`) after `l subname` finds the target lines.
+
 ## [0.7.0] - 2026-04-15
 
 Polish round + shipping the CCL adapter. Seven bug fixes found via
