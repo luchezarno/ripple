@@ -21,6 +21,7 @@ namespace Splash.Services.Adapters;
 [YamlSerializable(typeof(InjectSpec))]
 [YamlSerializable(typeof(InjectWindowsSpec))]
 [YamlSerializable(typeof(InjectUnixSpec))]
+[YamlSerializable(typeof(RcFileSpec))]
 [YamlSerializable(typeof(MarkerSpec))]
 [YamlSerializable(typeof(PromptSpec))]
 [YamlSerializable(typeof(ShellIntegrationSpec))]

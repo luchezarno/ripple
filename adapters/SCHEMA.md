@@ -152,7 +152,7 @@ ready:
 init:
   strategy: shell_integration | marker | prompt_variable | regex | none
   hook_type: prompt_function | preexec | ps0 | precommand_lookup_action | debug_trap | custom | none
-  delivery: launch_command | pty_inject | none
+  delivery: launch_command | pty_inject | rc_file | none
   script_resource: integration.ps1   # file under ShellIntegration/
   # -- OR inline:
   # script: |
@@ -167,10 +167,13 @@ init:
       Write-Host '{banner}' -ForegroundColor Green
     reason_template: |
       Write-Host 'Reason: {reason}' -ForegroundColor DarkYellow
-  inject:
+  inject:                           # delivery: pty_inject
     method: source_file
     windows: { ... }
     unix: { ... }
+  rc_file:                          # delivery: rc_file
+    dir_env_var: ZDOTDIR
+    file_name: .zshrc
   marker:                           # strategy: marker (REPL path)
     primary:      "\u0001SPLASH\u0001>>> "
     continuation: "\u0001SPLASH\u0001... "
@@ -204,8 +207,16 @@ from command output:
 - `launch_command` — passed as part of the process command line (e.g.
   pwsh's `-NoExit -Command ". '{path}'"`). Runs before the first prompt.
 - `pty_inject` — written to PTY stdin after the shell has printed its welcome
-  banner. Used by bash/zsh because shell command-line args don't let us source
+  banner. Used by bash because shell command-line args don't let it source
   arbitrary scripts silently.
+- `rc_file` — staged to a per-worker temp directory as a shell-native
+  startup file (e.g. `<tmpdir>/.zshrc`) and the shell's rc-directory
+  environment variable (`rc_file.dir_env_var`) is set to that path
+  before `CreateProcess`. The shell sources the file as part of its own
+  startup, so OSC-emitting hooks are live by the time the first prompt
+  is drawn — no PTY write needed. Used by zsh because PTY-injected
+  `source …` bytes get swallowed by ZLE under ConPTY without ever
+  submitting. Requires `rc_file.dir_env_var` and `rc_file.file_name`.
 - `none` — no external script; integration is entirely declarative (cmd's
   `prompt` variable carries the OSC sequences).
 

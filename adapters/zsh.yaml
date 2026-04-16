@@ -24,22 +24,18 @@ ready:
 init:
   strategy: shell_integration
   hook_type: preexec
-  delivery: pty_inject
-  inject:
-    method: source_file
-    windows:
-      tempfile_prefix: .splash-integration-
-      tempfile_extension: .sh
-      wsl_path_template: "/mnt/{drive_lower}{path_unix}"
-      msys_path_template: "/{drive_lower}{path_unix}"
-      source_command_template: "source '{unix_path}'; rm -f '{unix_path}'\n"
-    unix:
-      tempfile_path_template: "/tmp/.splash-integration-{pid}.sh"
-      source_command_template: |
-        cat > {tempfile_path} << 'SPLASH_EOF'
-        {script_body}
-        SPLASH_EOF
-        source {tempfile_path}; rm -f {tempfile_path}
+  # rc_file delivery: splash writes integration.zsh as .zshrc into a
+  # per-worker temp dir and exports ZDOTDIR into the child environment
+  # before CreateProcess. zsh reads $ZDOTDIR/.zshrc as part of its own
+  # startup, so the precmd / preexec hooks are registered by the time
+  # the first prompt is drawn — OSC 633 A fires naturally without any
+  # PTY-side source command. This is the only reliable delivery mode
+  # for MSYS2 zsh under ConPTY: pty_inject hangs forever because ZLE
+  # buffers the injected bytes without treating \n or \r\n as Enter.
+  delivery: rc_file
+  rc_file:
+    dir_env_var: ZDOTDIR
+    file_name: .zshrc
   script_resource: integration.zsh
 
 prompt:

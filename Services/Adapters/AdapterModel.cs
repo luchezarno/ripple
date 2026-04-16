@@ -112,7 +112,7 @@ public class InitSpec
 {
     public string Strategy { get; set; } = "none";    // shell_integration | marker | prompt_variable | regex | none
     public string HookType { get; set; } = "none";    // prompt_function | preexec | ps0 | precommand_lookup_action | debug_trap | custom | none
-    public string Delivery { get; set; } = "none";    // launch_command | pty_inject | none
+    public string Delivery { get; set; } = "none";    // launch_command | pty_inject | rc_file | none
     public string? ScriptResource { get; set; }
     public string? Script { get; set; }
     public string? InitInvocationTemplate { get; set; }
@@ -121,7 +121,37 @@ public class InitSpec
     public TempfileSpec? Tempfile { get; set; }
     public BannerInjectionSpec? BannerInjection { get; set; }
     public InjectSpec? Inject { get; set; }
+    public RcFileSpec? RcFile { get; set; }
     public MarkerSpec? Marker { get; set; }
+}
+
+/// <summary>
+/// Integration delivered by staging the script as a shell-specific
+/// startup file that the interpreter sources automatically on its own
+/// initialisation. The worker writes the script to a per-worker
+/// temporary directory and sets the environment variable the shell
+/// consults to locate that directory before <c>CreateProcess</c>, so
+/// the OSC-emitting hooks are already installed by the time the first
+/// prompt is drawn. Bypasses the PTY entirely, avoiding the ZLE /
+/// readline submission-ambiguity that breaks <c>delivery: pty_inject</c>
+/// for zsh under ConPTY.
+/// </summary>
+public class RcFileSpec
+{
+    /// <summary>
+    /// Name of the environment variable the shell reads to locate its
+    /// rc-file directory. For zsh this is <c>ZDOTDIR</c>; other shells
+    /// with equivalent hooks would use their own (e.g. future fish
+    /// adapter: <c>XDG_CONFIG_HOME</c>).
+    /// </summary>
+    public string? DirEnvVar { get; set; }
+
+    /// <summary>
+    /// Basename the script is written as inside the staged directory
+    /// (e.g. <c>.zshrc</c>). Must match what the shell reads from the
+    /// directory pointed to by <see cref="DirEnvVar"/>.
+    /// </summary>
+    public string? FileName { get; set; }
 }
 
 public class TempfileSpec

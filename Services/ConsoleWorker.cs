@@ -311,26 +311,34 @@ public class ConsoleWorker
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         var envOverrides = _adapter?.Process.Env;
 
-        // zsh: stage integration.zsh as a ZDOTDIR-rooted .zshrc so zsh sources
-        // it automatically on startup instead of relying on pty_inject. MSYS2
-        // zsh under ConPTY runs ZLE in a mode where PTY-injected "source ..."
-        // bytes get swallowed without submitting (ZLE treats neither \n nor
-        // \r\n as Enter reliably from our write path), so the inject-based
-        // flow hangs on WaitForReady forever. The ZDOTDIR trick sidesteps ZLE
-        // entirely — hooks are registered before the first prompt is drawn,
-        // so OSC 633 A fires naturally on initial startup. Only applied to
-        // zsh: bash / other shells continue through the pty_inject path which
-        // they already handle correctly.
-        if (_shellFamily == "zsh" && _adapter?.IntegrationScript is string zshScript && OperatingSystem.IsWindows())
+        // init.delivery: rc_file — stage the integration script as a
+        // shell-specific rc file that the interpreter sources on its own
+        // startup, before any PTY interaction. The hooks are registered
+        // by the time the first prompt is drawn, so the ready-phase
+        // inject cycle is bypassed entirely. zsh is the motivating case:
+        // MSYS2 zsh under ConPTY runs ZLE in a mode that swallows
+        // PTY-written `source <tmpfile>` bytes without submitting them
+        // (neither \n nor \r\n is a reliable Enter from our write path),
+        // so pty_inject hangs on WaitForReady forever. ZDOTDIR sidesteps
+        // ZLE entirely. The same mechanism extends to any shell with an
+        // rc-directory env var (future fish / bash --init-file use cases).
+        if (_adapter?.Init.Delivery == "rc_file"
+            && _adapter.Init.RcFile is { DirEnvVar: string envVar, FileName: string fileName }
+            && !string.IsNullOrEmpty(envVar) && !string.IsNullOrEmpty(fileName)
+            && _adapter.IntegrationScript is string rcScript)
         {
-            var zdotdir = Path.Combine(Path.GetTempPath(), $".splash-zsh-{Environment.ProcessId}");
-            Directory.CreateDirectory(zdotdir);
-            await File.WriteAllTextAsync(Path.Combine(zdotdir, ".zshrc"), zshScript.Replace("\r\n", "\n"), ct);
+            var rcDir = Path.Combine(Path.GetTempPath(), $".splash-{_shellFamily}-{Environment.ProcessId}");
+            Directory.CreateDirectory(rcDir);
+            // Line endings are normalised to LF before write: the shells
+            // that read rc files under this delivery mode (zsh on MSYS2,
+            // future fish, etc.) all come from the POSIX lineage and
+            // parse CRLF as part of the command text.
+            await File.WriteAllTextAsync(Path.Combine(rcDir, fileName), rcScript.Replace("\r\n", "\n"), ct);
             envOverrides = new Dictionary<string, string>(envOverrides ?? new Dictionary<string, string>())
             {
-                ["ZDOTDIR"] = zdotdir
+                [envVar] = rcDir
             };
-            Log($"zsh: staged {zdotdir}\\.zshrc; ZDOTDIR set in child env");
+            Log($"rc_file delivery: staged {rcDir}\\{fileName}; {envVar} set in child env");
         }
 
         _pty = PtyFactory.Start(commandLine, _cwd, cols, rows,
@@ -816,13 +824,16 @@ public class ConsoleWorker
             return;
         }
 
-        // zsh's integration is delivered via ZDOTDIR/.zshrc staged before
-        // process spawn (see the env setup in RunAsync). The hooks are live
-        // by the time zsh draws its first prompt, so there is nothing to do
-        // via pty_inject — zsh's own startup already fired everything.
-        if (_shellFamily == "zsh")
+        // init.delivery: rc_file — the script was staged before
+        // CreateProcess (see the env setup in RunAsync) and the shell
+        // sources it on its own startup, so pty_inject is a no-op.
+        // InjectShellIntegration is still called from the ready path
+        // because the settle/suppress/kick orchestration around it
+        // applies identically; the delivery-mode check short-circuits
+        // only the PTY write.
+        if (_adapter?.Init.Delivery == "rc_file")
         {
-            Log("zsh: integration already staged via ZDOTDIR; skipping pty_inject");
+            Log("rc_file delivery: integration already staged before spawn; skipping pty_inject");
             return;
         }
 
