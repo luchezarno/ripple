@@ -65,6 +65,7 @@ public class ProcessLauncher
     // any keystrokes the user types land in splash's shell until
     // they notice and re-focus their original window.
     private const uint STARTF_USESHOWWINDOW = 0x00000001;
+    private const ushort SW_HIDE = 0;
     private const ushort SW_SHOWNOACTIVATE = 4;
 
     /// <summary>
@@ -92,7 +93,15 @@ public class ProcessLauncher
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return LaunchWithCleanEnvironment($"\"{exePath}\" {args}", cwd);
+            // Hide the console window entirely for test workers. Normal
+            // splash usage shows the worker console (SW_SHOWNOACTIVATE)
+            // because the user needs to see and interact with the shared
+            // shell. During --adapter-tests there's no human in the loop:
+            // hiding the window prevents the rapid window creation / focus
+            // churn that disrupts the user's other windows. `noUserInput`
+            // is already the signal "this is a test worker" so we reuse it
+            // rather than threading a separate `hideWindow` parameter.
+            return LaunchWithCleanEnvironment($"\"{exePath}\" {args}", cwd, hideWindow: noUserInput);
         }
         else
         {
@@ -140,7 +149,7 @@ public class ProcessLauncher
     /// The process gets its own console window and does NOT inherit
     /// the MCP server's environment variables.
     /// </summary>
-    private int LaunchWithCleanEnvironment(string commandLine, string? workingDirectory = null)
+    private int LaunchWithCleanEnvironment(string commandLine, string? workingDirectory = null, bool hideWindow = false)
     {
         IntPtr hToken = IntPtr.Zero;
         IntPtr env = IntPtr.Zero;
@@ -167,11 +176,19 @@ public class ProcessLauncher
             // splash's shell. The console is still fully visible and
             // the user can click into it deliberately whenever they
             // want to inspect or interact with the shell.
+            //
+            // When hideWindow=true (test workers, --no-user-input), the
+            // console is suppressed entirely with SW_HIDE. This prevents
+            // the rapid window creation / focus churn that disrupts the
+            // user during full --adapter-tests runs — 15+ windows opening
+            // in succession otherwise steals focus and renders the user's
+            // typing into other apps unusable. Test workers have no
+            // human in the loop, so there's nothing to show.
             var si = new STARTUPINFOW
             {
                 cb = (uint)Marshal.SizeOf<STARTUPINFOW>(),
                 dwFlags = STARTF_USESHOWWINDOW,
-                wShowWindow = SW_SHOWNOACTIVATE,
+                wShowWindow = hideWindow ? SW_HIDE : SW_SHOWNOACTIVATE,
             };
             var pi = new PROCESS_INFORMATION();
 
