@@ -310,6 +310,29 @@ public class ConsoleWorker
         int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         var envOverrides = _adapter?.Process.Env;
+
+        // zsh: stage integration.zsh as a ZDOTDIR-rooted .zshrc so zsh sources
+        // it automatically on startup instead of relying on pty_inject. MSYS2
+        // zsh under ConPTY runs ZLE in a mode where PTY-injected "source ..."
+        // bytes get swallowed without submitting (ZLE treats neither \n nor
+        // \r\n as Enter reliably from our write path), so the inject-based
+        // flow hangs on WaitForReady forever. The ZDOTDIR trick sidesteps ZLE
+        // entirely — hooks are registered before the first prompt is drawn,
+        // so OSC 633 A fires naturally on initial startup. Only applied to
+        // zsh: bash / other shells continue through the pty_inject path which
+        // they already handle correctly.
+        if (_shellFamily == "zsh" && _adapter?.IntegrationScript is string zshScript && OperatingSystem.IsWindows())
+        {
+            var zdotdir = Path.Combine(Path.GetTempPath(), $".splash-zsh-{Environment.ProcessId}");
+            Directory.CreateDirectory(zdotdir);
+            await File.WriteAllTextAsync(Path.Combine(zdotdir, ".zshrc"), zshScript.Replace("\r\n", "\n"), ct);
+            envOverrides = new Dictionary<string, string>(envOverrides ?? new Dictionary<string, string>())
+            {
+                ["ZDOTDIR"] = zdotdir
+            };
+            Log($"zsh: staged {zdotdir}\\.zshrc; ZDOTDIR set in child env");
+        }
+
         _pty = PtyFactory.Start(commandLine, _cwd, cols, rows,
             inheritEnvironment: inheritEnv,
             envOverrides: envOverrides);
@@ -790,6 +813,16 @@ public class ConsoleWorker
         if (script == null)
         {
             Log($"WARNING: No shell integration script found, falling back to no-OSC mode");
+            return;
+        }
+
+        // zsh's integration is delivered via ZDOTDIR/.zshrc staged before
+        // process spawn (see the env setup in RunAsync). The hooks are live
+        // by the time zsh draws its first prompt, so there is nothing to do
+        // via pty_inject — zsh's own startup already fired everything.
+        if (_shellFamily == "zsh")
+        {
+            Log("zsh: integration already staged via ZDOTDIR; skipping pty_inject");
             return;
         }
 
