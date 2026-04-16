@@ -55,7 +55,13 @@ output:
 input:
   line_ending: "\n"
   multiline_detect: prompt_based
-  multiline_delivery: direct
+  # Multi-line delivery for zsh is handled by ConsoleWorker's
+  # hardcoded isMultiLinePosix branch (pre-schema legacy), which
+  # writes the body to a .sh tempfile and dot-sources it. The
+  # schema's generic multiline_delivery: tempfile dispatch never
+  # reaches zsh, but declaring it here keeps the yaml honest
+  # about what actually happens at runtime.
+  multiline_delivery: tempfile
   # zsh's default ZLE binding (zsh-line-editor) is emacs-style
   # without requiring `bindkey -e`, with Ctrl-A bound to
   # beginning-of-line and Ctrl-K bound to kill-line. Sending

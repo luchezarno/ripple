@@ -71,7 +71,13 @@ output:
 input:
   line_ending: "\n"
   multiline_detect: prompt_based
-  multiline_delivery: direct
+  # Multi-line delivery for bash is handled by ConsoleWorker's
+  # hardcoded isMultiLinePosix branch (pre-schema legacy), which
+  # writes the body to a .sh tempfile and dot-sources it. The
+  # schema's generic multiline_delivery: tempfile dispatch never
+  # reaches bash, but declaring it here keeps the yaml honest
+  # about what actually happens at runtime.
+  multiline_delivery: tempfile
   chunk_delay_ms: 0
   # bash's interactive line editor is GNU readline in emacs mode
   # (the default unless the user puts `set -o vi` in .inputrc or
