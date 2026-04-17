@@ -96,6 +96,27 @@ public class ConsoleManager
         // cleared.
         public string? LastActiveCwd;
         public string? LastActiveShellPath;
+
+        // Per-logical-shell cwd continuity (keyed by the shell executable's
+        // resolved absolute path). Populated as the AI works across shells;
+        // consulted when a new physical console is needed for a shell this
+        // agent has used before (auto-route to standby, auto-spawn after
+        // close, reuse-on-start_console) so the cd preamble lands at the
+        // cwd the AI last observed, not wherever the fresh shell naturally
+        // starts. Distinct from LastActiveCwd, which only remembers the
+        // single most-recently-active console across all shells and is
+        // cleared after one use.
+        public readonly Dictionary<string, string> ShellCwd = new(StringComparer.OrdinalIgnoreCase);
+
+        // First-natural-cwd capture per logical shell. Set once, on the
+        // first fresh launch where the user didn't supply an explicit cwd —
+        // whatever the shell's own startup picked (typically $HOME) is
+        // recorded here and used later when the AI calls start_console
+        // without a cwd argument and ripple needs to restore the logical
+        // shell to its "home". Keyed by shell_path, same as ShellCwd.
+        // Remains UNKNOWN (missing key) until such a natural fresh launch
+        // has happened; design.md §3-B covers the fallback behavior.
+        public readonly Dictionary<string, string> ShellHome = new(StringComparer.OrdinalIgnoreCase);
     }
 
     private AgentSessionState GetOrCreateAgentState(string agentId)
@@ -244,14 +265,24 @@ public class ConsoleManager
                             catch { /* best-effort */ }
                         }
                     }
-                    UpdateConsoleInfo(standby.Value.Pid, info => info.LastAiCwd = targetCwd);
+                    RecordShellCwd(standby.Value.Pid, targetCwd);
                 }
 
-                // Display banner on reused console via pipe
+                // Display banner on reused console via pipe. Pass the target
+                // cwd too so the worker can use it as the kick command —
+                // writing a bare "\r" after the banner would make shells
+                // (pwsh/bash/zsh via OSC 633 integration) report it as a
+                // user-typed empty command, flipping _userCommandBusy for
+                // the duration of the shell's empty-line handling and
+                // making the start_console response claim Busy even
+                // though nothing is actually running. Issuing the cd_command
+                // as an AI-marked command sidesteps that — the OSC B/C pair
+                // the shell emits while it runs the cd is gated by the
+                // tracker's _isAiCommand flag.
                 if (!string.IsNullOrEmpty(banner) || !string.IsNullOrEmpty(reason))
                 {
                     if (reusePipe != null)
-                        try { await SendPipeRequestAsync(reusePipe, w => { w.WriteString("type", "display_banner"); w.WriteStringOrNull("banner", banner); w.WriteStringOrNull("reason", reason); }, TimeSpan.FromSeconds(3)); } catch { }
+                        try { await SendPipeRequestAsync(reusePipe, w => { w.WriteString("type", "display_banner"); w.WriteStringOrNull("banner", banner); w.WriteStringOrNull("reason", reason); w.WriteStringOrNull("cwd", targetCwd); }, TimeSpan.FromSeconds(10)); } catch { }
                 }
 
                 string? reusedCwd;
@@ -278,7 +309,16 @@ public class ConsoleManager
         // (e.g., /mnt/c/foo for WSL bash, C:\foo for pwsh).
         var initialCwd = await QueryConsoleCwdAsync(pipeName);
         if (initialCwd != null)
-            UpdateConsoleInfo(pid, info => info.LastAiCwd = initialCwd);
+        {
+            RecordShellCwd(pid, initialCwd);
+            // First natural-launch cwd observation for this logical shell —
+            // capture it as the "home" to return to on later
+            // start_console calls without an explicit cwd. The capture is
+            // gated on `cwd == null` so that a user who explicitly named a
+            // cwd on first launch doesn't freeze that path as the shell's
+            // home. No-op if we already have a home recorded.
+            if (cwd == null) RecordShellHomeIfUnset(pid, initialCwd);
+        }
 
         try { await SendPipeRequestAsync(pipeName, w => { w.WriteString("type", "set_title"); w.WriteString("title", displayName); }, TimeSpan.FromSeconds(3)); }
         catch { /* best-effort */ }
@@ -588,7 +628,7 @@ public class ConsoleManager
                 // `cd /d "..." && `; after TrimEnd we get the bare cd.
                 cdCommand = cdPreamble.TrimEnd('&', ';', ' ');
                 expectedCwdAfterCd = preambleCwd;
-                UpdateConsoleInfo(consolePid, info => info.LastAiCwd = preambleCwd);
+                RecordShellCwd(consolePid, preambleCwd);
             }
 
             if (sourceDrifted)
@@ -602,25 +642,64 @@ public class ConsoleManager
         }
         else if (isSwitching)
         {
-            // Cases requiring user confirmation:
-            //   - Explicit cross-shell switch by the caller (shell=X with a
-            //     different active console). Path translation between bash
-            //     and Windows-native shells is not attempted — the caller
-            //     asked for a different shell on purpose, so we warn and let
-            //     the AI re-execute with the cwd it actually wants.
-            //   - Fresh start (no previous active console — AI doesn't know cwd)
-            //   - Switch to standby with no source cwd
-            // Involuntary cross-shell switches (active busy with no shell param)
-            // no longer reach this branch — resolvedShell is pinned to the busy
-            // source earlier, so the find/auto-start above stays same-family.
+            // Cases reaching this branch:
+            //   - Cross-shell switch where the AI has already used the target
+            //     shell before (ShellCwd[targetShellPath] is populated) —
+            //     silently restore that cwd via cd preamble, no refuse.
+            //   - Cross-shell switch to a shell the AI has never used (first
+            //     execute_command for this logical shell, no previous state)
+            //     — refuse with a first-use notice so the AI can confirm
+            //     where the new console landed before running anything
+            //     destructive there (design.md §5-C Case 6).
+            //   - Fresh start with no previous active console — same
+            //     first-use refuse path.
+            //   - Switch to standby with no source cwd — first-use refuse.
+            // Involuntary cross-shell switches (active busy with no shell
+            // param) don't reach this branch; resolvedShell is pinned to
+            // the busy source earlier so find/auto-start stays same-family.
+            string? targetShellPath;
+            lock (_lock) targetShellPath = _consoles.GetValueOrDefault(consolePid)?.ShellPath;
+
+            string? storedShellCwd = null;
+            if (!string.IsNullOrEmpty(targetShellPath))
+            {
+                lock (_lock)
+                    GetOrCreateAgentState(agentId).ShellCwd.TryGetValue(targetShellPath, out storedShellCwd);
+            }
+
+            if (!string.IsNullOrEmpty(storedShellCwd) && !string.IsNullOrEmpty(targetShellFamily))
+            {
+                // Silent restore: this shell has a remembered cwd from the
+                // agent's prior work. Issue the cd as a preamble and let
+                // the pipeline run, same as the same-family branch does.
+                var cdPreamble = BuildCdPreamble(targetShellFamily!, storedShellCwd!);
+                if (cdPreamble != null)
+                {
+                    cdCommand = cdPreamble.TrimEnd('&', ';', ' ');
+                    expectedCwdAfterCd = storedShellCwd;
+                    RecordShellCwd(consolePid, storedShellCwd);
+                }
+                var targetDisplay = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+                routingNotice = routingNotice
+                    ?? $"Note: switched to {targetDisplay} (shell={targetShellFamily}); restored cwd to '{storedShellCwd}'.";
+                return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice, EarlyResult: null);
+            }
+
+            // First-use refuse: no stored cwd means this is the agent's
+            // first interaction with this logical shell. Surface the full
+            // shell_path so the AI can confirm the resolution before any
+            // destructive pipeline runs at the shell's natural home.
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+            var shellPathNotice = !string.IsNullOrEmpty(targetShellPath)
+                ? $"\nResolved shell: {targetShellPath}"
+                : "";
             return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice,
                 EarlyResult: new ExecuteResult
                 {
                     Pid = consolePid,
                     Switched = true,
                     DisplayName = displayName,
-                    Output = $"Switched to console {displayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
+                    Output = $"Switched to console {displayName}. Pipeline NOT executed — first execute_command for this logical shell. Re-send to run at the console's current cwd, or call start_console(shell=..., cwd=...) to target a specific directory.{shellPathNotice}",
                 });
         }
         else
@@ -637,7 +716,7 @@ public class ConsoleManager
 
             if (IsCwdDrifted(lastAiCwd, currentCwd))
             {
-                UpdateConsoleInfo(consolePid, info => info.LastAiCwd = currentCwd);
+                RecordShellCwd(consolePid, currentCwd);
                 var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
                 return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice,
                     EarlyResult: new ExecuteResult
@@ -725,7 +804,7 @@ public class ConsoleManager
                         // shell actually ended up at so subsequent
                         // execute_commands from the AI don't keep
                         // trying to return to the unreachable path.
-                        UpdateConsoleInfo(consolePid, info => info.LastAiCwd = cdActualCwd);
+                        RecordShellCwd(consolePid, cdActualCwd);
                         return new ExecuteResult
                         {
                             Pid = consolePid,
@@ -842,7 +921,7 @@ public class ConsoleManager
 
             // Update LastAiCwd with the result cwd (the cwd the command ended at)
             if (cwdResult != null)
-                UpdateConsoleInfo(consolePid, info => info.LastAiCwd = cwdResult);
+                RecordShellCwd(consolePid, cwdResult);
 
             return new ExecuteResult
             {
@@ -1047,6 +1126,54 @@ public class ConsoleManager
         {
             var info = _consoles.GetValueOrDefault(pid);
             if (info != null) update(info);
+        }
+    }
+
+    /// <summary>
+    /// Central point for recording the AI's observed cwd after a command
+    /// completes on a specific console. Atomically updates both the
+    /// per-console <see cref="ConsoleInfo.LastAiCwd"/> (used for drift
+    /// detection on the next call) and the owning agent's
+    /// <see cref="AgentSessionState.ShellCwd"/> entry for this logical
+    /// shell (used when a later call needs a cd preamble for a *different*
+    /// physical console of the same shell — auto-route, auto-spawn,
+    /// reuse-on-start_console). Pass an empty or whitespace cwd and the
+    /// call is a no-op so callers don't have to guard.
+    /// </summary>
+    private void RecordShellCwd(int pid, string? cwd)
+    {
+        if (string.IsNullOrWhiteSpace(cwd)) return;
+        lock (_lock)
+        {
+            var info = _consoles.GetValueOrDefault(pid);
+            if (info == null) return;
+            info.LastAiCwd = cwd;
+            var agentId = GetAgentIdFromPipeName(info.PipePath);
+            if (string.IsNullOrEmpty(agentId) || string.IsNullOrEmpty(info.ShellPath)) return;
+            GetOrCreateAgentState(agentId).ShellCwd[info.ShellPath] = cwd;
+        }
+    }
+
+    /// <summary>
+    /// First-natural-cwd capture for a logical shell (design.md §3-A).
+    /// Called once, the first time we observe a fresh-launched console's
+    /// own OSC A cwd without the AI having supplied an explicit cwd —
+    /// whatever the shell naturally picked becomes the "home" we return
+    /// to on later <c>start_console</c> calls that don't name a cwd.
+    /// No-op if <see cref="AgentSessionState.ShellHome"/> already has an
+    /// entry for this shell_path (the capture is lazy and one-shot).
+    /// </summary>
+    private void RecordShellHomeIfUnset(int pid, string? cwd)
+    {
+        if (string.IsNullOrWhiteSpace(cwd)) return;
+        lock (_lock)
+        {
+            var info = _consoles.GetValueOrDefault(pid);
+            if (info == null) return;
+            var agentId = GetAgentIdFromPipeName(info.PipePath);
+            if (string.IsNullOrEmpty(agentId) || string.IsNullOrEmpty(info.ShellPath)) return;
+            var state = GetOrCreateAgentState(agentId);
+            state.ShellHome.TryAdd(info.ShellPath, cwd);
         }
     }
 
@@ -1858,6 +1985,21 @@ public class ConsoleManager
         if (parts.Length > 0 && int.TryParse(parts[^1], out var pid))
             return pid;
         return null;
+    }
+
+    /// <summary>
+    /// Extract the owning agent_id from an owned pipe name
+    /// (<c>RP.{proxyPid}.{agentId}.{consolePid}</c>). Returns null for
+    /// unowned pipes (<c>RP.{consolePid}</c>, 2 segments) or malformed
+    /// names. Treat null as "no owner — don't update per-agent state"; a
+    /// subsequent claim will attach the console to a specific agent and
+    /// regenerate the pipe name in the owned form.
+    /// </summary>
+    public static string? GetAgentIdFromPipeName(string pipeName)
+    {
+        var parts = pipeName.Split('.');
+        if (parts.Length != 4) return null;
+        return parts[2];
     }
 
     // --- Helpers ---

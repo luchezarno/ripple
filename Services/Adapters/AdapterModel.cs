@@ -517,6 +517,27 @@ public class CapabilitiesSpec
     public string? ShellIntegration { get; set; }
     public string? UserBusyDetection { get; set; }   // osc_b | process_polling | none
     public UserBusyDetectionParams? UserBusyDetectionParams { get; set; }
+
+    /// <summary>
+    /// Template for a runtime cd command that the adapter accepts on its
+    /// already-running shell/REPL. <c>{path}</c> is substituted with the
+    /// target cwd (after applying <see cref="CdCommandQuote"/> escape
+    /// rules). Used by ConsoleManager to inject a cd preamble during
+    /// auto-route / auto-spawn / reuse on start_console. Omit for
+    /// adapters that don't participate in cwd management (or whose
+    /// cwd concept doesn't map to a shell-like cd command).
+    /// </summary>
+    public string? CdCommand { get; set; }
+
+    /// <summary>
+    /// Quote context for the <c>{path}</c> substitution in
+    /// <see cref="CdCommand"/>. Enum string: <c>single_quote_posix</c>
+    /// (bash/zsh/sh — escape <c>'</c> as <c>'\''</c>), <c>single_quote_pwsh</c>
+    /// (pwsh/powershell — escape <c>'</c> as <c>''</c>),
+    /// <c>double_quote_cmd</c> (cmd — escape <c>"</c> as <c>""</c>).
+    /// Must be set whenever <see cref="CdCommand"/> is set; null otherwise.
+    /// </summary>
+    public string? CdCommandQuote { get; set; }
 }
 
 public class UserBusyDetectionParams

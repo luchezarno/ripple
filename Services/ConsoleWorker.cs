@@ -2069,7 +2069,7 @@ public class ConsoleWorker
             "send_input" => await HandleSendInputAsync(request, ct),
             "drain_post_output" => await HandleDrainPostOutputAsync(request, ct),
             "set_title" => HandleSetTitle(request),
-            "display_banner" => HandleDisplayBanner(request),
+            "display_banner" => await HandleDisplayBannerAsync(request, ct),
             "claim" => HandleClaim(request),
             "ping" => SerializeResponse(w => w.WriteString("status", "ok")),
             _ => SerializeResponse(w => w.WriteString("error", $"Unknown request type: {type}")),
@@ -2881,18 +2881,59 @@ public class ConsoleWorker
         }
     }
 
-    private JsonElement HandleDisplayBanner(JsonElement request)
+    private async Task<JsonElement> HandleDisplayBannerAsync(JsonElement request, CancellationToken ct)
     {
         var banner = request.TryGetProperty("banner", out var bp) ? bp.GetString() : null;
         var reason = request.TryGetProperty("reason", out var rp) ? rp.GetString() : null;
+        var cwd = request.TryGetProperty("cwd", out var cp) ? cp.GetString() : null;
         WriteBannerText(banner, reason);
 
-        // Kick the shell to draw a fresh prompt after the banner
-        var enter = _adapter?.Input.LineEnding
-            ?? _defaultEnter;
+        // Preferred kick: run the adapter's cd_command as an AI-tracked
+        // command. That flags _isAiCommand in the tracker, which gates the
+        // OSC B/C pair the shell emits — so the shell's "I'm about to run
+        // something" markers don't flip the user-typed-command view that
+        // drives the proxy's Busy status. Side effect: the prompt is
+        // redrawn at the end of the cd, fulfilling the kick's original
+        // UX purpose (visible prompt below the banner).
+        var cdCmd = !string.IsNullOrEmpty(cwd) && _adapter != null
+            ? PathEscape.RenderCdCommand(_adapter, cwd!)
+            : null;
+        if (cdCmd != null && !_tracker.Busy)
+        {
+            try
+            {
+                // 5s is enough for a cd on any sane shell; if the shell is
+                // somehow stuck we prefer giving up and returning rather
+                // than holding the start_console response hostage.
+                var resultTask = _tracker.RegisterCommand(cdCmd, timeoutMs: 5000);
+                var enter = _adapter?.Input.LineEnding ?? _defaultEnter;
+                var payload = Encoding.UTF8.GetBytes(cdCmd + enter);
+                _pty?.InputStream.Write(payload, 0, payload.Length);
+                _pty?.InputStream.Flush();
+                await resultTask.WaitAsync(ct);
+                return SerializeResponse(w => w.WriteString("status", "ok"));
+            }
+            catch (InvalidOperationException)
+            {
+                // Tracker was already mid-command — very unlikely on a
+                // standby we just reused, but fall through to the raw kick
+                // so the banner at least gets its prompt redraw.
+            }
+            catch (Exception ex)
+            {
+                Log($"DisplayBanner cd kick failed: {ex.Message}");
+            }
+        }
+
+        // Fallback for adapters that don't declare cd_command (REPLs),
+        // or when the AI-tracked cd path bailed out: the original raw
+        // enter kick. Phantom-busy risk only materialises on adapters
+        // with an Enter-triggered OSC B hook, and those are exactly the
+        // adapters that have cd_command set, so this fallback is safe.
+        var fallbackEnter = _adapter?.Input.LineEnding ?? _defaultEnter;
         try
         {
-            var bytes = Encoding.UTF8.GetBytes(enter);
+            var bytes = Encoding.UTF8.GetBytes(fallbackEnter);
             _pty?.InputStream.Write(bytes, 0, bytes.Length);
             _pty?.InputStream.Flush();
         }

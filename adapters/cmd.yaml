@@ -96,6 +96,8 @@ capabilities:
     poll_interval_ms: 500
     cpu_busy_threshold_ms: 50
     include_children: true
+  cd_command: "cd /D \"{path}\""
+  cd_command_quote: double_quote_cmd
 
 probe:
   eval: "echo 2"

@@ -97,6 +97,8 @@ capabilities:
   job_control: false
   shell_integration: osc633
   user_busy_detection: osc_b
+  cd_command: "Set-Location -LiteralPath '{path}'"
+  cd_command_quote: single_quote_pwsh
 
 probe:
   eval: "1 + 1"
