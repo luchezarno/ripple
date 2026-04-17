@@ -4,7 +4,7 @@
   <img src="https://github.com/user-attachments/assets/1343f694-1c05-4899-9faa-d2b1138aa3ba" alt="social-image" width="640" />
 </div>
 
-**A shell MCP server for AI that actually holds a session.** Load `Import-Module Az` once and let AI run 50 follow-up cmdlets in milliseconds each. Watch every command happen in a real terminal window — the same one you can type into yourself.
+**A REPL-sharing MCP server for AI that actually holds a session.** Shell, Python, Node, a language debugger — whatever you'd open a REPL window for, ripple keeps it live between tool calls. Load `Import-Module Az` once and let AI run 50 follow-up cmdlets in milliseconds each; drop into `pdb` once and let AI step, inspect, and fix without restarting the process. Watch every command happen in a real terminal window — the same one you can type into yourself.
 
 > **Renamed from `splash` (v0.8.0).** The project shipped as `splashshell` on npm for v0.1.0 – v0.5.0, was renamed to `@ytsuda/splash` for v0.7.0, and renamed again to `@ytsuda/ripple` starting with v0.8.0 once the adapter framework grew past shells into any REPL. `@ytsuda/splash` and `splashshell` are both deprecated; uninstall them and install `@ytsuda/ripple` to keep receiving updates. The GitHub repo moved from `yotsuda/splash` to `yotsuda/ripple`; GitHub redirects old clone URLs automatically.
 
@@ -76,7 +76,7 @@ ripple opens a **real, visible terminal window**. You see every AI command as it
 
 | Tool | Description |
 |------|-------------|
-| `start_console` | Open a visible terminal window. Pick a shell (bash, pwsh, powershell, cmd, or a full path). Optional `cwd`, `banner`, and `reason` parameters. Reuses an existing standby of the same shell unless `reason` is provided. |
+| `start_console` | Open a visible terminal window. Pick any adapter — shells (bash, pwsh, zsh, cmd), REPLs (python, node, racket, ccl, abcl, fsi, jshell, groovysh, lua, deno, sqlite3), or debuggers (perldb, jdb, pdb). Optional `cwd`, `banner`, and `reason` parameters. Reuses an existing standby of the same adapter unless `reason` is provided. |
 | `execute_command` | Run a pipeline. Optionally specify `shell` to target a specific shell type — finds an existing console of that shell, or auto-starts one. Times out cleanly with output cached for `wait_for_completion`. On timeout, includes a `partialOutput` snapshot so the AI can diagnose stuck commands immediately. |
 | `wait_for_completion` | Block until busy consoles finish and retrieve cached output (use after a command times out). |
 | `peek_console` | Read-only snapshot of what a console is currently displaying. On Windows, reads the console screen buffer directly (exact match with the visible terminal). On Linux/macOS, uses a built-in VT terminal interpreter as fallback. Specify a console by display name or PID, or omit to peek at the active console. Reports busy/idle state, running command, and elapsed time. |
@@ -173,12 +173,15 @@ The csproj has `PublishAot=true`, so the published binary is a NativeAOT single-
 
 ## Platform support
 
-**Windows** is the primary target (ConPTY + Named Pipe, fully tested). Unix PTY fallback for Linux/macOS is experimental.
+**Windows** is the primary target (ConPTY + Named Pipe, fully tested).
+
+**Linux / macOS** are functional through the same adapter framework, using forkpty via `posix_spawn` + `POSIX_SPAWN_SETSID` and opening a visible terminal window through `$TERMINAL` (then `gnome-terminal` / `konsole` / `xfce4-terminal` / `mate-terminal` / `alacritty` / `kitty` / `foot` / `xterm` in turn) on Linux and `Terminal.app` on macOS. `start_console` and `execute_command` against bash, pwsh, and python round-trip cleanly; shell integration (OSC 633) fires on all three. See the limitations below for the outstanding interactive-rendering gaps.
 
 ## Known limitations
 
 - **cmd.exe exit codes always read as 0** — cmd's `PROMPT` can't expand `%ERRORLEVEL%` at display time, so AI commands show as `Finished (exit code unavailable)`. Use `pwsh` or `bash` for exit-code-aware work.
 - **Don't `Remove-Module PSReadLine -Force` inside a pwsh session** — PSReadLine's background reader threads survive module unload and steal console input, hanging the next AI command. Not recoverable.
+- **Linux / macOS: interactive rendering after AI commands can drift.** On Unix there's no in-process virtual terminal emulator between ripple and the hosted shell — the relay is byte-level. DSR cursor-position replies are fabricated from the adapter's known prompt shape, which is accurate enough that shells accept typed input and AI commands capture output correctly (matrix passes for bash / pwsh / python) but not precise enough to keep PSReadLine's history recall or bash readline's prompt redraw fully aligned with the physical cursor after large outputs. A full VT emulator layer is tracked as future work.
 
 ## License
 
