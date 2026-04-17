@@ -6,7 +6,7 @@
 
 **A shell MCP server for AI that actually holds a session.** Load `Import-Module Az` once and let AI run 50 follow-up cmdlets in milliseconds each. Watch every command happen in a real terminal window — the same one you can type into yourself.
 
-> **Renamed from `rippleshell`.** Previously published on npm as [`rippleshell`](https://www.npmjs.com/package/rippleshell) (v0.1.0 – v0.5.0); starting with v0.7.0 the package lives at [`@ytsuda/ripple`](https://www.npmjs.com/package/@ytsuda/ripple). `rippleshell` is deprecated — uninstall it and install `@ytsuda/ripple` to keep receiving updates. This repository was also renamed from `yotsuda/rippleshell` to `yotsuda/ripple`; GitHub redirects old clone URLs automatically.
+> **Renamed from `splash` (v0.8.0).** The project shipped as `splashshell` on npm for v0.1.0 – v0.5.0, was renamed to `@ytsuda/splash` for v0.7.0, and renamed again to `@ytsuda/ripple` starting with v0.8.0 once the adapter framework grew past shells into any REPL. `@ytsuda/splash` and `splashshell` are both deprecated; uninstall them and install `@ytsuda/ripple` to keep receiving updates. The GitHub repo moved from `yotsuda/splash` to `yotsuda/ripple`; GitHub redirects old clone URLs automatically.
 
 ## Install
 

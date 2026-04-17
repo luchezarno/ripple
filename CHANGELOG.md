@@ -393,7 +393,7 @@ A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. 
 
 ### Known limitations
 - **cmd.exe exit codes are always reported as 0**. cmd's PROMPT can't expand `%ERRORLEVEL%` at display time, so the worker emits a fake `OSC 633 D;0` after every command. AI commands show as `Finished (exit code unavailable)` to make the limitation visible. Use pwsh or bash if you need exit-code-aware execution. (The visible terminal still has the real `%ERRORLEVEL%`; only the AI-side capture is affected.)
-- **`Remove-Module PSReadLine` mid-session breaks the pwsh worker.** PSReadLine spawns persistent reader threads that survive module unload (.NET can't fully unload binary modules), so the orphaned threads keep consuming console input bytes and the next AI command hangs forever. Ripple can't recover from this state. Documented in README.
+- **`Remove-Module PSReadLine` mid-session breaks the pwsh worker.** PSReadLine spawns persistent reader threads that survive module unload (.NET can't fully unload binary modules), so the orphaned threads keep consuming console input bytes and the next AI command hangs forever. ripple can't recover from this state. Documented in README.
 - **cmd.exe builtin interactive prompts are not detected as user-busy** (`pause`, `set /p`). Zero CPU + zero children leave both polling signals silent. Uncommon enough to leave undetected.
 
 ## [0.4.0] - 2026-04-12
@@ -458,7 +458,7 @@ A quality-focused release built on top of the v0.2.0 foundation. pwsh is now sta
 
 ### Added
 - **Claim-handshake version check** — a strictly newer proxy trying to attach to an older worker is refused; the old worker marks itself obsolete and stops serving pipes while keeping the PTY alive for the human user, so the MCP session disconnects cleanly without killing the shell.
-- **npx-based install docs** — README now documents `npx rippleshell` as the primary install path.
+- **npx-based install docs** — README now documents `npx splashshell` as the primary install path.
 
 ## [0.1.0] - 2026-04-10
 
