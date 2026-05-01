@@ -364,6 +364,12 @@ public static class AdapterDeclaredTestsRunner
 
         var cwdAfterEval = evalResp.TryGetProperty("cwd", out var cw) ? cw.GetString() : null;
         var exitCode = evalResp.TryGetProperty("exitCode", out var ec) ? ec.GetInt32() : 0;
+        // lastExitCode is the worker-emitted OSC L value (raw $LASTEXITCODE
+        // when a native exe within a successful pipeline returned non-zero).
+        // The worker suppresses the field when it would be 0, so absence is
+        // the success signal; we default to 0 and let the assertion below
+        // treat 0 == "no LastExit reported".
+        var lastExitCode = evalResp.TryGetProperty("lastExitCode", out var lec) ? lec.GetInt32() : 0;
 
         if (test.ExpectCwdUpdate)
         {
@@ -387,6 +393,17 @@ public static class AdapterDeclaredTestsRunner
         if (test.ExpectExitCode is int expected && !test.ExitCodeIsUnreliable)
         {
             if (exitCode != expected) return false;
+        }
+
+        // expect_no_last_exit asserts that the worker did NOT emit a
+        // non-zero OSC L (= raw $LASTEXITCODE on success) for this
+        // eval. The fix to suppress phantom LastExit reports from
+        // manual `$LASTEXITCODE = N` assignments lives entirely on
+        // the L side — D stays 0 either way — so this is the only
+        // assertion that catches a regression of that gating logic.
+        if (test.ExpectNoLastExit && lastExitCode != 0)
+        {
+            return false;
         }
 
         // expect_error: true means the command should surface an

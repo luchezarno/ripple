@@ -165,18 +165,31 @@ tests:
     eval: "$PWD.Path"
     expect_cwd_update: true
   - name: manual_lastexitcode_does_not_leak_in_pipeline
-    # A bare `$LASTEXITCODE = 7` is just a variable assignment — no
-    # native exe ran, so the AI surfacing it as `exit 7` / `LastExit: 7`
-    # would be a phantom failure signal. Pre-fix the resolver gated only
-    # on "did $LASTEXITCODE change this pipeline" (yes), and the manual
-    # assignment leaked through identically to a real `cmd /c exit 7`.
-    # Post-fix the integration script also tracks whether
-    # PreCommandLookupAction ever resolved a command to Application;
-    # without that signal $LASTEXITCODE is not consulted, exit stays 0,
-    # and OSC L is suppressed.
+    # A bare `$LASTEXITCODE = N` is just a variable assignment — no
+    # native exe ran, so the AI surfacing it as `LastExit: N` would
+    # be a phantom failure signal. Pre-fix the resolver gated only on
+    # "did $LASTEXITCODE change this pipeline" (yes), and the manual
+    # assignment leaked through identically to a real `cmd /c exit N`.
+    # Post-fix the prompt fn AST-parses the last history command line
+    # and only consults $LASTEXITCODE when it sees an Application-
+    # resolving CommandAst; without that signal OSC L is suppressed
+    # so no LastExit shows up in the AI-facing status line.
+    #
+    # The setup runs `cmd /c exit 0` (instead of relying on whatever
+    # the previous test left in $LASTEXITCODE) and the eval assigns
+    # 99, so the lecChanged flag fires unambiguously: the resolver
+    # only stays silent if the native-seen gate is doing its job.
+    # Without the setup + the value flip, an earlier test's stale
+    # `$LASTEXITCODE = 7` would happen to make `$lecChanged = false`
+    # for `$LASTEXITCODE = 7`, hiding the bug behind a coincidence.
+    # expect_no_last_exit is the assertion that catches the L-side
+    # regression specifically — expect_exit_code: 0 was already true
+    # on the D side because $? stays true through a plain assignment.
+    setup: cmd /c exit 0
     eval: |
-      $LASTEXITCODE = 7
+      $LASTEXITCODE = 99
       "x"
     expect: '^x$'
     expect_exit_code: 0
+    expect_no_last_exit: true
 

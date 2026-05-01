@@ -117,6 +117,14 @@ public static class FileToolsTests
                 // old_string uses \n even though file is CRLF
                 var result = FileTools.EditFile(p, "日本語のテスト", "NIHONGO").GetAwaiter().GetResult();
                 Assert(result.StartsWith("Replaced 1"), $"EditFile on SJIS CRLF succeeds ({result})");
+                // Streaming path emits ±2 lines of context; on this 3-line
+                // file that's the full content, with the matched line marked
+                // by `:` and the surrounding lines by `-`. Verifies the
+                // RotateBuffer context emission survives Shift-JIS decoding.
+                Assert(result.Contains("   2: NIHONGO"),
+                    $"SJIS CRLF context: replaced line shown with ':' marker ({result})");
+                Assert(result.Contains("   1- 先頭行") && result.Contains("   3- 末尾行"),
+                    $"SJIS CRLF context: surrounding lines shown with '-' marker ({result})");
 
                 var after = File.ReadAllBytes(p);
                 var decoded = sjis.GetString(after);
@@ -296,6 +304,63 @@ public static class FileToolsTests
                 Assert(result.StartsWith("Replaced 3"), $"replace_all count ({result})");
                 var after = File.ReadAllText(p);
                 Assert(after == "b\nb\nb\n", $"replace_all content ({after.Replace("\n", "\\n")})");
+                // Each replaced line should appear with the `:` marker. The
+                // file is 3 lines long so all are matches; ±2 context just
+                // means each match gets shown once on its own row.
+                Assert(result.Contains("   1: b") && result.Contains("   2: b") && result.Contains("   3: b"),
+                    $"replace_all context: every replaced line shown ({result})");
+            }
+
+            // --- EditFile streaming context: ±2 surrounding lines ---
+            // Larger file so the context window is non-trivial: 7 lines, the
+            // match on line 4. Pre-context buffer should yield lines 2-3,
+            // afterCounter should yield lines 5-6. Lines 1 and 7 must NOT
+            // appear because they fall outside the ±2 window.
+
+            {
+                var p = Path.Combine(tmpRoot, "context-window.txt");
+                File.WriteAllText(p,
+                    "L1\nL2\nL3\nMATCH\nL5\nL6\nL7\n",
+                    new UTF8Encoding(false));
+                var result = FileTools.EditFile(p, "MATCH", "REPLACED").GetAwaiter().GetResult();
+                Assert(result.StartsWith("Replaced 1"), $"streaming match found ({result})");
+                Assert(result.Contains("   4: REPLACED"),
+                    $"streaming context: replaced line shown ({result})");
+                Assert(result.Contains("   2- L2") && result.Contains("   3- L3"),
+                    $"streaming context: 2 lines before shown ({result})");
+                Assert(result.Contains("   5- L5") && result.Contains("   6- L6"),
+                    $"streaming context: 2 lines after shown ({result})");
+                Assert(!result.Contains("L1") && !result.Contains("L7"),
+                    $"streaming context: lines outside ±2 window suppressed ({result})");
+            }
+
+            // --- EditFile streaming gap separator between distant matches ---
+            // Two matches with > 4 lines between them: each gets its own
+            // ±2 window and a blank line separates the windows so the AI
+            // can tell adjacent matches apart from one merged span.
+
+            {
+                var p = Path.Combine(tmpRoot, "gap-window.txt");
+                File.WriteAllText(p,
+                    "MATCH\nA\nB\nC\nD\nE\nF\nMATCH\n",
+                    new UTF8Encoding(false));
+                var result = FileTools.EditFile(p, "MATCH", "X", replace_all: true).GetAwaiter().GetResult();
+                Assert(result.StartsWith("Replaced 2"), $"streaming replace_all count ({result})");
+                Assert(result.Contains("   1: X") && result.Contains("   8: X"),
+                    $"streaming gap: both replaced lines shown ({result})");
+                // The two windows are line 1 + lines 2-3 (after) for match
+                // #1, and lines 6-7 (before) + line 8 for match #2. The
+                // middle lines (4-5: MID4, MID5) fall outside both ±2
+                // windows and must NOT appear. Use unique tokens so the
+                // assertion can't be fooled by an incidental letter in
+                // the path / prefix message.
+                File.WriteAllText(p,
+                    "MATCH\nA\nB\nMID4\nMID5\nE\nF\nMATCH\n",
+                    new UTF8Encoding(false));
+                var result2 = FileTools.EditFile(p, "MATCH", "X", replace_all: true).GetAwaiter().GetResult();
+                Assert(result2.StartsWith("Replaced 2"), $"streaming gap (with unique tokens) count ({result2})");
+                Assert(!result2.Contains("MID4") && !result2.Contains("MID5"),
+                    $"streaming gap: middle lines (outside both ±2 windows) suppressed ({result2})");
             }
         }
         finally

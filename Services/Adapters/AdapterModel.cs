@@ -649,6 +649,18 @@ public class AdapterTest
     public string? Expect { get; set; }
     public bool ExpectError { get; set; }
     public int? ExpectExitCode { get; set; }
+    /// <summary>
+    /// Assert that the worker did NOT emit a non-zero `lastExitCode`
+    /// field on this eval. Used to verify pwsh integration
+    /// suppresses phantom LastExit reports — e.g. a manual
+    /// `$LASTEXITCODE = 7` assignment must not surface as
+    /// `LastExit: 7` in the AI-facing status line. Distinct from
+    /// expect_exit_code (= the OSC D code, the overall pipeline
+    /// outcome): a manual-assignment leak shows D=0 (pipeline
+    /// succeeded) but L=7 (phantom native exit), and only the new
+    /// assertion catches the L side.
+    /// </summary>
+    public bool ExpectNoLastExit { get; set; }
     public bool ExpectCwdUpdate { get; set; }
     public string? ExpectMode { get; set; }
     public int? ExpectLevel { get; set; }

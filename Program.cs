@@ -174,6 +174,7 @@ public class Program
             Tests.CommandOutputRendererTests.Run();
             Tests.CommandOutputFinalizerTests.Run();
             Tests.FileToolsTests.Run();
+            Tests.ShellToolsTests.Run();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);
             if (args.Contains("--e2e"))
             {

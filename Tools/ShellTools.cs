@@ -36,9 +36,10 @@ public class ShellTools
     /// nothing scrolls it out. The AI seeing this on every peek_console
     /// call is pure noise — same text every time, no actionable signal —
     /// so we drop it before building the response. Anything we can't
-    /// confidently match stays put.
+    /// confidently match stays put. Internal (not private) so unit tests
+    /// can exercise it without going through the full peek pipe.
     /// </summary>
-    private static string FilterStartupBanners(string snapshot)
+    internal static string FilterStartupBanners(string snapshot)
     {
         if (string.IsNullOrEmpty(snapshot)) return snapshot;
         if (!snapshot.Contains("Warning: PowerShell detected")) return snapshot;
