@@ -61,14 +61,17 @@ internal static class FileMetadataHelper
         else if (headerContent.Contains("\r"))
             newlineSequence = "\r";
 
-        bool hasTrailingNewline = false;
-        if (tailLength > 0)
-        {
-            if (tailLength >= 2 && tailBytes[tailLength - 2] == 0x0D && tailBytes[tailLength - 1] == 0x0A)
-                hasTrailingNewline = true;
-            else if (tailBytes[tailLength - 1] == 0x0A || tailBytes[tailLength - 1] == 0x0D)
-                hasTrailingNewline = true;
-        }
+        // Trailing-newline check uses the DECODED tail. Looking at raw bytes
+        // works for UTF-8 (LF = 0x0A is a single byte), but in UTF-16 LE the
+        // last byte of a trailing '\n' is 0x00 (the high byte) — a raw-byte
+        // check would miss it and the streaming writer would then drop the
+        // trailing newline on round-trip. For files larger than the header
+        // buffer the tail bytes may begin mid-character; the encoding's
+        // decoder fallback handles that gracefully (replacement char on the
+        // partial unit), and we only care about the final character anyway.
+        string tailContent = encoding.GetString(tailBytes, 0, tailLength);
+        bool hasTrailingNewline = tailContent.Length > 0 &&
+            (tailContent[^1] == '\n' || tailContent[^1] == '\r');
 
         return (newlineSequence, hasTrailingNewline);
     }

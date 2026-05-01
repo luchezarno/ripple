@@ -102,7 +102,7 @@ public class FileTools
     }
 
     [McpServerTool]
-    [Description("Edit a file by replacing an exact string with a new string. By default old_string must be unique. Use replace_all to replace all occurrences. Preserves the file's original encoding and newline sequence.")]
+    [Description("Edit a file by replacing an exact string with a new string. By default old_string must be unique. Use replace_all to replace all occurrences. Preserves the file's original encoding and newline sequence. Response includes ±2 lines of surrounding context for each replacement so the AI can verify the change without re-reading the file.")]
     public static Task<string> EditFile(
         [Description("Absolute path to the file")] string path,
         [Description("Exact string to find and replace")] string old_string,
@@ -114,20 +114,199 @@ public class FileTools
 
         var meta = FileMetadataHelper.DetectFileMetadata(path);
 
-        // Read with detected encoding, then normalize to LF for matching.
-        // This lets old_string/new_string use \n even when the file is CRLF —
-        // we convert everything back to the file's original newline on write.
+        // Multi-line old_string still uses the whole-file path: a match that
+        // spans lines can't be detected line-by-line, and a character-level
+        // sliding window adds significant complexity for a rarer case.
+        // Single-line old_string takes the streaming path with a RotateBuffer
+        // for ±2 lines of context — that covers the common edit shape (one
+        // identifier or one call-site at a time) without ever loading the
+        // whole file into memory.
+        bool isMultiline = old_string.Contains('\n') || old_string.Contains('\r');
+        return Task.FromResult(isMultiline
+            ? EditFileMultiline(path, old_string, new_string, replace_all, meta)
+            : EditFileSingleLine(path, old_string, new_string, replace_all, meta));
+    }
+
+    /// <summary>
+    /// Streaming edit for single-line old_string. Reads the file once with a
+    /// StreamReader, writes to a same-volume temp file with a StreamWriter,
+    /// and atomically renames into place. A 2-slot RotateBuffer holds the
+    /// most recent non-match lines so we can emit ±2 lines of context around
+    /// each replacement without buffering the whole file.
+    ///
+    /// On non-replace_all mode, replacements are written optimistically: if a
+    /// second match is later discovered, we keep streaming (without applying
+    /// further replacements) so we can report the total occurrence count to
+    /// the caller, then delete the temp instead of renaming. The same
+    /// behavior shape the whole-file version had — error message wording is
+    /// unchanged so existing tests still pass.
+    /// </summary>
+    private static string EditFileSingleLine(string path, string oldText, string newText, bool replaceAll, FileMetadata meta)
+    {
+        // new_string is allowed to span lines even when old_string doesn't.
+        // Normalize any newline flavour the caller sent to the file's own
+        // sequence so the post-replace line carries native line endings.
+        var normalizedNew = newText.Contains('\n') || newText.Contains('\r')
+            ? newText.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", meta.NewlineSequence)
+            : newText;
+
+        var preContext = new RotateBuffer<(string line, int num)>(2);
+        var contextOut = new StringBuilder();
+        int afterCounter = 0;
+        int lastEmittedLine = 0;
+        int matchCount = 0;
+        bool aborted = false;
+
+        var dir = Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(dir)) dir = ".";
+        var tempFile = Path.Combine(dir, $".{Path.GetFileName(path)}.ripple-{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            using (var reader = new StreamReader(path, meta.Encoding, detectEncodingFromByteOrderMarks: true,
+                new FileStreamOptions { Access = FileAccess.Read, Share = FileShare.ReadWrite }))
+            using (var writer = new StreamWriter(tempFile, append: false, meta.Encoding, bufferSize: 65536) { NewLine = meta.NewlineSequence })
+            {
+                int lineNum = 0;
+                string? line;
+                bool firstWritten = false;
+
+                while ((line = reader.ReadLine()) != null)
+                {
+                    lineNum++;
+
+                    int occInLine = CountOccurrences(line, oldText);
+                    string outLine;
+
+                    if (occInLine > 0 && !aborted)
+                    {
+                        bool acceptHere;
+                        if (replaceAll)
+                        {
+                            acceptHere = true;
+                        }
+                        else
+                        {
+                            // Unique mode: accept iff this is the first match
+                            // anywhere AND there's only one occurrence on this
+                            // line. Anything else is non-unique → abort.
+                            acceptHere = matchCount == 0 && occInLine == 1;
+                        }
+
+                        if (acceptHere)
+                        {
+                            outLine = line.Replace(oldText, normalizedNew);
+
+                            // Emit a blank gap separator if this match is far
+                            // enough away from the last emitted line to leave
+                            // a gap in the context view.
+                            if (lastEmittedLine > 0 && lineNum - 2 > lastEmittedLine + 1)
+                                contextOut.AppendLine();
+
+                            // Pre-context: lines from RotateBuffer that haven't
+                            // been emitted as post-context for an earlier match.
+                            foreach (var (ctxLine, ctxNum) in preContext)
+                            {
+                                if (ctxNum > lastEmittedLine)
+                                {
+                                    contextOut.Append($"{ctxNum,4}- ").AppendLine(ctxLine);
+                                    lastEmittedLine = ctxNum;
+                                }
+                            }
+
+                            contextOut.Append($"{lineNum,4}: ").AppendLine(outLine);
+                            lastEmittedLine = lineNum;
+                            afterCounter = 2;
+                            matchCount += occInLine;
+                        }
+                        else
+                        {
+                            // Second+ match in non-replace_all mode (or two
+                            // occurrences on the first match line). Stop
+                            // replacing further but keep streaming + counting
+                            // so the error message can report the total.
+                            aborted = true;
+                            outLine = line;
+                            matchCount += occInLine;
+                        }
+                    }
+                    else if (occInLine > 0 && aborted)
+                    {
+                        outLine = line;
+                        matchCount += occInLine;
+                    }
+                    else
+                    {
+                        outLine = line;
+                        if (afterCounter > 0)
+                        {
+                            contextOut.Append($"{lineNum,4}- ").AppendLine(line);
+                            lastEmittedLine = lineNum;
+                            afterCounter--;
+                        }
+                        preContext.Add((line, lineNum));
+                    }
+
+                    // Write to temp. Newline goes BEFORE the next line, not
+                    // after this one — that way we only emit a trailing
+                    // newline at EOF if the source file had one.
+                    if (firstWritten)
+                        writer.Write(meta.NewlineSequence);
+                    writer.Write(outLine);
+                    firstWritten = true;
+                }
+
+                if (firstWritten && meta.HasTrailingNewline)
+                    writer.Write(meta.NewlineSequence);
+            }
+
+            if (matchCount == 0)
+            {
+                File.Delete(tempFile);
+                return "Error: old_string not found in file.";
+            }
+            if (!replaceAll && matchCount > 1)
+            {
+                File.Delete(tempFile);
+                return $"Error: old_string found {matchCount} times. It must be unique. Add more context or use replace_all.";
+            }
+
+            File.Move(tempFile, path, overwrite: true);
+
+            var summary = $"Replaced {matchCount} occurrence{(matchCount != 1 ? "s" : "")} in {path}";
+            return contextOut.Length == 0
+                ? summary
+                : summary + "\n" + contextOut.ToString().TrimEnd('\r', '\n');
+        }
+        catch
+        {
+            try { if (File.Exists(tempFile)) File.Delete(tempFile); } catch { }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Whole-file edit for multi-line old_string. Same matching semantics as
+    /// before (LF-normalize both sides for matching, write back with the
+    /// file's original newline sequence), with the response now including
+    /// ±2 lines of context around the first replacement so the AI can
+    /// verify the change. Streaming for multi-line spans would need a
+    /// character-level sliding window — out of scope here; the common case
+    /// (single-line) is the one we optimize.
+    /// </summary>
+    private static string EditFileMultiline(string path, string oldText, string newText, bool replaceAll, FileMetadata meta)
+    {
         var rawContent = File.ReadAllText(path, meta.Encoding);
         var content = ToLf(rawContent, meta.NewlineSequence);
-        var oldNorm = ToLf(old_string, meta.NewlineSequence);
-        var newNorm = ToLf(new_string, meta.NewlineSequence);
+        var oldNorm = ToLf(oldText, meta.NewlineSequence);
+        var newNorm = ToLf(newText, meta.NewlineSequence);
 
         var firstIdx = content.IndexOf(oldNorm, StringComparison.Ordinal);
-        if (firstIdx == -1) return Task.FromResult("Error: old_string not found in file.");
+        if (firstIdx == -1) return "Error: old_string not found in file.";
 
         string resultLf;
         int replacedCount;
-        if (replace_all)
+        if (replaceAll)
         {
             var sb = new StringBuilder();
             int lastEnd = 0, idx = firstIdx, count = 0;
@@ -151,7 +330,7 @@ public class FileTools
                 int count = 0;
                 int idx = -1;
                 while ((idx = content.IndexOf(oldNorm, idx + 1, StringComparison.Ordinal)) != -1) count++;
-                return Task.FromResult($"Error: old_string found {count} times. It must be unique. Add more context or use replace_all.");
+                return $"Error: old_string found {count} times. It must be unique. Add more context or use replace_all.";
             }
             resultLf = string.Concat(content.AsSpan(0, firstIdx), newNorm, content.AsSpan(firstIdx + oldNorm.Length));
             replacedCount = 1;
@@ -159,7 +338,80 @@ public class FileTools
 
         var finalContent = FromLf(resultLf, meta.NewlineSequence);
         File.WriteAllText(path, finalContent, meta.Encoding);
-        return Task.FromResult($"Replaced {replacedCount} occurrence{(replacedCount > 1 ? "s" : "")} in {path}");
+
+        var ctx = BuildMultilineContext(resultLf, firstIdx, newNorm.Length);
+        var summary = $"Replaced {replacedCount} occurrence{(replacedCount != 1 ? "s" : "")} in {path}";
+        return string.IsNullOrEmpty(ctx) ? summary : summary + "\n" + ctx;
+    }
+
+    /// <summary>
+    /// Build a ±2 line context view around the multi-line replacement that
+    /// landed at <paramref name="matchStartLfIdx"/> in the LF-normalized
+    /// post-replace content. Replacement lines are marked with `:`, context
+    /// lines with `-`, matching the streaming path's format.
+    /// </summary>
+    private static string BuildMultilineContext(string lfContent, int matchStartLfIdx, int newLength)
+    {
+        var lines = lfContent.Split('\n');
+
+        int startLine = 0;
+        int charsSeen = 0;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            int lineLen = lines[i].Length + 1; // +1 for the '\n'
+            if (charsSeen + lineLen > matchStartLfIdx)
+            {
+                startLine = i;
+                break;
+            }
+            charsSeen += lineLen;
+        }
+
+        int endLine = startLine;
+        int matchEnd = matchStartLfIdx + newLength;
+        int sweep = charsSeen;
+        for (int i = startLine; i < lines.Length; i++)
+        {
+            int lineLen = lines[i].Length + 1;
+            if (sweep >= matchEnd) { endLine = i - 1; break; }
+            sweep += lineLen;
+            endLine = i;
+        }
+
+        int ctxStart = Math.Max(0, startLine - 2);
+        int ctxEnd = Math.Min(lines.Length - 1, endLine + 2);
+
+        // The Split('\n') above produces a trailing empty entry when the file
+        // ends with '\n'; drop that from the visible context tail.
+        if (ctxEnd == lines.Length - 1 && lines[ctxEnd].Length == 0 && ctxEnd > 0)
+            ctxEnd--;
+
+        var sb = new StringBuilder();
+        for (int i = ctxStart; i <= ctxEnd; i++)
+        {
+            bool isMatch = i >= startLine && i <= endLine;
+            sb.Append($"{i + 1,4}{(isMatch ? ':' : '-')} ").AppendLine(lines[i]);
+        }
+        return sb.ToString().TrimEnd('\r', '\n');
+    }
+
+    /// <summary>
+    /// Count non-overlapping occurrences of <paramref name="needle"/> in
+    /// <paramref name="haystack"/>. Equivalent to
+    /// (haystack.Length - haystack.Replace(needle, "").Length) / needle.Length
+    /// but without the intermediate string allocation, which matters when the
+    /// streaming path scans every line.
+    /// </summary>
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        if (needle.Length == 0) return 0;
+        int count = 0, idx = 0;
+        while ((idx = haystack.IndexOf(needle, idx, StringComparison.Ordinal)) != -1)
+        {
+            count++;
+            idx += needle.Length;
+        }
+        return count;
     }
 
     [McpServerTool]
