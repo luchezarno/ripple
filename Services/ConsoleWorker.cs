@@ -1691,14 +1691,14 @@ public class ConsoleWorker
                 }
                 rawInstalled = true;
 
-                // Belt-and-braces termios restore: the finally block handles the
-                // normal path, this catches an out-of-band process exit (signal,
-                // crash) that skips managed cleanup.
-                var savedSnapshot = saved;
-                AppDomain.CurrentDomain.ProcessExit += (_, _) =>
-                {
-                    try { UnixPty.TcSetAttr(0, UnixPty.TCSANOW, savedSnapshot); } catch { }
-                };
+                // termios is restored by the finally block on graceful exit.
+                // We deliberately do NOT register an AppDomain.ProcessExit
+                // hook for the signal/crash path: that handler doesn't fire
+                // on SIGTERM/SIGKILL/segfault, and on the graceful path it
+                // would run AFTER the finally has already FreeHGlobal'd
+                // `saved`, dereferencing freed memory. If a real signal-
+                // catching restore is ever needed, it has to come from a
+                // PosixSignalRegistration on a buffer with longer lifetime.
 
                 var buf = new byte[256];
                 while (!ct.IsCancellationRequested)
