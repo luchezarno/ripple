@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using Ripple.Services.Adapters;
 
@@ -30,6 +31,20 @@ public static class ModeDetector
     // ~/.ripple/adapters/*.yaml can't pin the worker on every prompt.
     private static readonly TimeSpan MatchTimeout = TimeSpan.FromSeconds(1);
 
+    // Detect runs in a per-command poll loop, so building a fresh Regex
+    // every call burned cycles for no reason — adapter patterns are
+    // immutable for the worker's lifetime. Memoize compiled instances
+    // keyed by source pattern; the sentinel value marks patterns we've
+    // already proven to be invalid (so we don't re-throw on every poll).
+    private static readonly ConcurrentDictionary<string, Regex?> _regexCache = new();
+
+    private static Regex? GetCompiledRegex(string pattern) =>
+        _regexCache.GetOrAdd(pattern, static p =>
+        {
+            try { return new Regex(p, RegexOptions.Compiled | RegexOptions.Multiline, MatchTimeout); }
+            catch { return null; }
+        });
+
     /// <summary>
     /// Inspect the tail of <paramref name="recentOutput"/> against
     /// every mode declared in <paramref name="modes"/> and return the
@@ -54,9 +69,8 @@ public static class ModeDetector
             var pattern = mode.Detect ?? mode.Primary;
             if (string.IsNullOrEmpty(pattern)) continue;
 
-            Regex re;
-            try { re = new Regex(pattern, RegexOptions.Multiline, MatchTimeout); }
-            catch { continue; }
+            var re = GetCompiledRegex(pattern);
+            if (re is null) continue;
 
             Match match;
             try { match = re.Match(recentOutput); }

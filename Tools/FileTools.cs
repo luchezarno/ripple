@@ -1,4 +1,5 @@
 using ModelContextProtocol.Server;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -423,7 +424,7 @@ public class FileTools
         [Description("Maximum number of matching lines to return")] int max_results = 50,
         CancellationToken cancellationToken = default)
     {
-        var regex = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        var regex = GetSearchRegex(pattern);
         var basePath = path ?? Directory.GetCurrentDirectory();
         var results = new List<string>();
 
@@ -616,10 +617,34 @@ public class FileTools
 
     private static bool MatchGlob(string str, string pattern)
     {
-        var regexPattern = "^" + Regex.Escape(pattern)
-            .Replace(@"\*\*", ".*")
-            .Replace(@"\*", @"[^/\\]*")
-            .Replace(@"\?", ".") + "$";
-        return Regex.IsMatch(str, regexPattern, RegexOptions.IgnoreCase);
+        return GetGlobRegex(pattern).IsMatch(str);
     }
+
+    // Compile-once-reuse caches for the two regex hot paths in this file.
+    // - `MatchGlob` runs per file entry inside the recursive walk; with N
+    //   files in a tree, an AI doing a repo-wide find_files / search_files
+    //   round-trip would otherwise call `Regex.Escape` + chained Replace +
+    //   `Regex.IsMatch` (whose static cache caps at 15 patterns) once per
+    //   entry. Caching here turns N compilations into 1 per glob.
+    // - `SearchFiles`'s `pattern` parameter is constant for the duration of
+    //   one tool call but is often reused across calls in the same session
+    //   (an AI that greps for the same symbol while iterating on an edit).
+    // The caches are unbounded by design: in practice the cardinality of
+    // distinct patterns in one MCP session is small (tens at most), and
+    // each compiled Regex is on the order of KB. If memory ever becomes a
+    // concern, swap for an LRU bound.
+    private static readonly ConcurrentDictionary<string, Regex> _globRegexCache = new();
+    private static readonly ConcurrentDictionary<string, Regex> _searchRegexCache = new();
+
+    private static Regex GetGlobRegex(string globPattern) =>
+        _globRegexCache.GetOrAdd(globPattern, p => new Regex(
+            "^" + Regex.Escape(p)
+                .Replace(@"\*\*", ".*")
+                .Replace(@"\*", @"[^/\\]*")
+                .Replace(@"\?", ".") + "$",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled));
+
+    private static Regex GetSearchRegex(string pattern) =>
+        _searchRegexCache.GetOrAdd(pattern, p => new Regex(
+            p, RegexOptions.IgnoreCase | RegexOptions.Compiled));
 }
