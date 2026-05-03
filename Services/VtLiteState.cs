@@ -363,12 +363,22 @@ public sealed class VtLiteState
     {
         if (Row < _scrollTop || Row > _scrollBottom) return;
         n = Math.Max(1, Math.Min(n, _scrollBottom - Row + 1));
+        var sw = SoftWrap;
         for (int i = 0; i < n; i++)
         {
             var bot = Grid[_scrollBottom];
-            for (int r = _scrollBottom; r > Row; r--) Grid[r] = Grid[r - 1];
+            // Rotate Grid and SoftWrap in lockstep — without the SoftWrap
+            // shift, freshly-inserted blank rows would inherit the wrap
+            // flag of whatever row used to live at that index, producing
+            // ghost soft-wrap continuations on lines that aren't wrapped.
+            for (int r = _scrollBottom; r > Row; r--)
+            {
+                Grid[r] = Grid[r - 1];
+                sw[r] = sw[r - 1];
+            }
             Array.Fill(bot, ' ');
             Grid[Row] = bot;
+            sw[Row] = false;
         }
     }
 
@@ -381,12 +391,21 @@ public sealed class VtLiteState
     {
         if (Row < _scrollTop || Row > _scrollBottom) return;
         n = Math.Max(1, Math.Min(n, _scrollBottom - Row + 1));
+        var sw = SoftWrap;
         for (int i = 0; i < n; i++)
         {
             var top = Grid[Row];
-            for (int r = Row; r < _scrollBottom; r++) Grid[r] = Grid[r + 1];
+            // Rotate Grid and SoftWrap in lockstep so the freshly-blank
+            // bottom row doesn't carry the wrap flag of whatever content
+            // it displaced.
+            for (int r = Row; r < _scrollBottom; r++)
+            {
+                Grid[r] = Grid[r + 1];
+                sw[r] = sw[r + 1];
+            }
             Array.Fill(top, ' ');
             Grid[_scrollBottom] = top;
+            sw[_scrollBottom] = false;
         }
     }
 
